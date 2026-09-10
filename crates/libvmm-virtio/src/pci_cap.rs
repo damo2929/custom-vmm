@@ -34,6 +34,23 @@ pub const fn modern_device_id(virtio_id: u16) -> u16 {
     0x1040 + virtio_id
 }
 
+/// The PCI subsystem device ID a non-transitional virtio device must carry.
+///
+/// Virtio 1.x §4.1.2.1: a non-transitional device SHOULD set its PCI
+/// Subsystem Device ID to **0x40 or higher**. The field carries no other
+/// meaning for such a device — the device type is already in the device ID —
+/// so the only thing it does is separate modern devices from transitional
+/// ones, which reuse the field for the device type.
+///
+/// It is not decorative. edk2's `Virtio10BindingSupported` tests
+/// `Pci.Device.SubsystemID >= 0x40` and returns `EFI_UNSUPPORTED` below it,
+/// so a device that puts its virtio type here — 8 for SCSI, 16 for GPU —
+/// is enumerated by the firmware, assigned resources, and then never bound
+/// to a driver. Linux does not perform that check, so the same device works
+/// perfectly under Linux and is invisible to UEFI: a disk that a guest OS
+/// can use and the firmware cannot boot from.
+pub const MODERN_SUBSYSTEM_ID: u16 = 0x0040;
+
 /// Offsets within `COMMON_CFG` (virtio 1.2 §4.1.4.3).
 pub mod common_cfg {
     pub const DEVICE_FEATURE_SELECT: usize = 0x00;
@@ -59,6 +76,11 @@ pub mod common_cfg {
 ///
 /// One 64-bit BAR holds all four capability regions at fixed offsets, so a
 /// device's BAR can be sized once and the capabilities emitted mechanically.
+///
+/// Plain data — twelve integers — so it is `Copy`: the platform reads it
+/// back out of a device to emit that device's PCI capabilities, and
+/// borrowing it across a lock would be the only reason not to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BarLayout {
     pub common_offset: u32,
     pub common_length: u32,

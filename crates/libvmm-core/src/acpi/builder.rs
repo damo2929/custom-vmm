@@ -420,21 +420,61 @@ fn build_dsdt() -> Vec<u8> {
     t
 }
 
-/// FADT (revision 6) — carries `RESET_REG` and the SLP typing used for
-/// powerdown (§1.5, §8.5).
+/// FADT (revision 6) — the hardware-reduced description of the CloudHv
+/// platform (Revision D.10).
 ///
-/// Legacy fields are zeroed and `IAPC_BOOT_ARCH` declares no 8042, no VGA,
-/// no CMOS RTC: this is a legacy-free machine.
+/// # Why hardware-reduced
+///
+/// The machine has no chipset, and its power management is two byte-wide
+/// registers at `0x0600`/`0x0601` plus a free-running timer at `0x0608`.
+/// That is ACPI 5.0's hardware-reduced profile exactly, and the FADT has to
+/// say so — the flag is not a preference, it tells the operating system
+/// which half of this table to believe.
+///
+/// The previous version of this function claimed the opposite and supplied
+/// none of what that implies: `HW_REDUCED_ACPI` clear but `FIRMWARE_CTRL`
+/// zero, which is illegal because a FACS is mandatory then; `PM_TMR_BLK`
+/// zero although the timer exists; `PM1a_EVT_BLK` at `0x05FC`, which
+/// nothing decodes; and `PM1a_CNT_BLK` at `0x0600`, which on this platform
+/// is `SLEEP_CONTROL_REG` and means something else entirely. Linux
+/// tolerated all of it.
+///
+/// # Why the PM1 blocks exist anyway
+///
+/// A hardware-reduced platform has no PM1 event or control block. This one
+/// declares both, at ports [`cloudhv::PM1A_EVT_IO_ADDRESS`] and
+/// [`cloudhv::PM1A_CNT_IO_ADDRESS`], for the reason Cloud Hypervisor gives
+/// in `vmm/src/acpi.rs`:
+///
+/// > Windows' nested-Hyper-V hvloader rejects a HW-reduced FADT whose PM1a
+/// > GAS is zero; point the blocks at unused ACPI I/O ports (conforming
+/// > guests ignore them).
+///
+/// [`cloudhv::PM1A_EVT_IO_ADDRESS`]: crate::cloudhv::PM1A_EVT_IO_ADDRESS
+/// [`cloudhv::PM1A_CNT_IO_ADDRESS`]: crate::cloudhv::PM1A_CNT_IO_ADDRESS
 fn build_fadt() -> Vec<u8> {
+    use crate::cloudhv;
+
     /// bit 1 = 8042 absent, bit 2 = no VGA, bit 5 = no CMOS RTC.
+    ///
+    /// The RTC bit is set and the machine does have a CMOS at `0x70`. That
+    /// is not a contradiction: on a hardware-reduced platform ACPI has no
+    /// RTC, and a guest reads the wall clock through UEFI's `GetTime`,
+    /// which is the firmware reading that same CMOS. What the bit forbids
+    /// is the guest going behind the firmware's back.
     const IAPC_LEGACY_FREE: u16 = (1 << 1) | (1 << 2) | (1 << 5);
-    /// RESET_REG_SUP (bit 10) | HW_REDUCED_ACPI is deliberately *not* set:
-    /// we still present PM1 blocks for S5.
-    const FADT_RESET_REG_SUP: u32 = 1 << 10;
+    /// `TMR_VAL_EXT` (bit 8): the PM timer counts 32 bits, not 24.
+    /// `RESET_REG_SUP` (bit 10): `RESET_REG` below is real.
+    /// `HW_REDUCED_ACPI` (bit 20): believe the sleep registers, not the
+    /// PM1 control block.
+    const FADT_FLAGS: u32 = (1 << 8) | (1 << 10) | (1 << 20);
 
     let mut t = Vec::new();
     SdtHeader::new(b"FACP", 6, b"RVMMFACP").write_into(&mut t);
-    t.extend_from_slice(&0u32.to_le_bytes()); // FIRMWARE_CTRL (32-bit), unused
+    // FIRMWARE_CTRL and X_FIRMWARE_CTRL stay zero. ACPI 6.5 §5.2.9: with
+    // HW_REDUCED_ACPI set there is no FACS, and pointing at one is an
+    // error rather than a courtesy.
+    t.extend_from_slice(&0u32.to_le_bytes()); // FIRMWARE_CTRL (32-bit)
     t.extend_from_slice(&0u32.to_le_bytes()); // DSDT (32-bit), filled in by link_fadt_to_dsdt
     t.push(0); // reserved
     t.push(0); // preferred PM profile: unspecified
@@ -444,18 +484,18 @@ fn build_fadt() -> Vec<u8> {
     t.push(0); // ACPI_DISABLE
     t.push(0); // S4BIOS_REQ
     t.push(0); // PSTATE_CNT
-    t.extend_from_slice(&(PM1A_CNT_ADDR as u32 - 4).to_le_bytes()); // PM1a_EVT_BLK
+    t.extend_from_slice(&u32::from(cloudhv::PM1A_EVT_IO_ADDRESS).to_le_bytes()); // PM1a_EVT_BLK
     t.extend_from_slice(&0u32.to_le_bytes()); // PM1b_EVT_BLK
-    t.extend_from_slice(&(PM1A_CNT_ADDR as u32).to_le_bytes()); // PM1a_CNT_BLK
+    t.extend_from_slice(&u32::from(cloudhv::PM1A_CNT_IO_ADDRESS).to_le_bytes()); // PM1a_CNT_BLK
     t.extend_from_slice(&0u32.to_le_bytes()); // PM1b_CNT_BLK
     t.extend_from_slice(&0u32.to_le_bytes()); // PM2_CNT_BLK
-    t.extend_from_slice(&0u32.to_le_bytes()); // PM_TMR_BLK: no PIT-era timer
+    t.extend_from_slice(&u32::from(cloudhv::ACPI_TIMER_IO_ADDRESS).to_le_bytes()); // PM_TMR_BLK
     t.extend_from_slice(&0u32.to_le_bytes()); // GPE0_BLK
     t.extend_from_slice(&0u32.to_le_bytes()); // GPE1_BLK
     t.push(4); // PM1_EVT_LEN
     t.push(2); // PM1_CNT_LEN
     t.push(0); // PM2_CNT_LEN
-    t.push(0); // PM_TMR_LEN
+    t.push(4); // PM_TMR_LEN
     t.push(0); // GPE0_BLK_LEN
     t.push(0); // GPE1_BLK_LEN
     t.push(0); // GPE1_BASE
@@ -471,27 +511,28 @@ fn build_fadt() -> Vec<u8> {
     t.push(0); // CENTURY
     t.extend_from_slice(&IAPC_LEGACY_FREE.to_le_bytes()); // IAPC_BOOT_ARCH
     t.push(0); // reserved
-    t.extend_from_slice(&FADT_RESET_REG_SUP.to_le_bytes()); // flags
+    t.extend_from_slice(&FADT_FLAGS.to_le_bytes()); // flags
 
-    // RESET_REG — a GAS in system I/O space, pulsed on WSS `reboot`.
+    // RESET_REG — a GAS in system I/O space, decoded by `CloudHvPm`.
     t.extend_from_slice(&gas_io(RESET_REG_ADDR, 8));
     t.push(RESET_VALUE); // RESET_VALUE
     t.extend_from_slice(&0u16.to_le_bytes()); // ARM_BOOT_ARCH
-    t.push(6); // FADT minor version
+    t.push(3); // FADT minor version — ACPI 6.3
 
     t.extend_from_slice(&0u64.to_le_bytes()); // X_FIRMWARE_CTRL
     t.extend_from_slice(&0u64.to_le_bytes()); // X_DSDT, filled in by link_fadt_to_dsdt
-    t.extend_from_slice(&gas_io(PM1A_CNT_ADDR - 4, 32)); // X_PM1a_EVT_BLK
+    t.extend_from_slice(&gas_io(u64::from(cloudhv::PM1A_EVT_IO_ADDRESS), 32)); // X_PM1a_EVT_BLK
     t.extend_from_slice(&[0u8; 12]); // X_PM1b_EVT_BLK
-    t.extend_from_slice(&gas_io(PM1A_CNT_ADDR, 16)); // X_PM1a_CNT_BLK
+    t.extend_from_slice(&gas_io(u64::from(cloudhv::PM1A_CNT_IO_ADDRESS), 16)); // X_PM1a_CNT_BLK
     t.extend_from_slice(&[0u8; 12]); // X_PM1b_CNT_BLK
     t.extend_from_slice(&[0u8; 12]); // X_PM2_CNT_BLK
-    t.extend_from_slice(&[0u8; 12]); // X_PM_TMR_BLK
+    t.extend_from_slice(&gas_io(u64::from(cloudhv::ACPI_TIMER_IO_ADDRESS), 32)); // X_PM_TMR_BLK
     t.extend_from_slice(&[0u8; 12]); // X_GPE0_BLK
     t.extend_from_slice(&[0u8; 12]); // X_GPE1_BLK
-    t.extend_from_slice(&[0u8; 12]); // SLEEP_CONTROL_REG
-    t.extend_from_slice(&[0u8; 12]); // SLEEP_STATUS_REG
-    t.extend_from_slice(&[0u8; 8]); // Hypervisor Vendor Identity
+                                     // The two registers that *are* the power management on this machine.
+    t.extend_from_slice(&gas_io(u64::from(cloudhv::ACPI_SHUTDOWN_IO_ADDRESS), 8)); // SLEEP_CONTROL_REG
+    t.extend_from_slice(&gas_io(u64::from(cloudhv::ACPI_SLEEP_STATUS_IO_ADDRESS), 8)); // SLEEP_STATUS_REG
+    t.extend_from_slice(b"RUSTVMM "); // Hypervisor Vendor Identity
 
     finalize(&mut t);
     t

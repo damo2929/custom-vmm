@@ -96,6 +96,36 @@ struct MemEntry {
     length: u32,
 }
 
+/// Where the pages of the resource on screen live, so the host can read
+/// the framebuffer of a guest that never flushes. See
+/// [`VirtioGpu::scanout_backing`].
+#[derive(Debug, Clone)]
+pub struct ScanoutBacking {
+    pub width: u32,
+    pub height: u32,
+    entries: Vec<MemEntry>,
+}
+
+/// Read a whole scanout out of guest memory, as a frame.
+///
+/// Returns `None` if any of the backing is unreadable, which is the right
+/// answer for a framebuffer the guest has torn down.
+pub fn frame_from_backing<M: GuestMemory>(mem: &M, backing: &ScanoutBacking) -> Option<Scanout> {
+    let mut pixels = vec![0u8; backing.width as usize * backing.height as usize * 4];
+    read_backing(mem, &backing.entries, 0, &mut pixels).ok()?;
+    Some(Scanout {
+        width: backing.width,
+        height: backing.height,
+        pixels,
+        damage: Rect {
+            x: 0,
+            y: 0,
+            width: backing.width,
+            height: backing.height,
+        },
+    })
+}
+
 /// A host-private 2D resource.
 struct Resource {
     width: u32,
@@ -170,6 +200,34 @@ impl VirtioGpu {
     /// costs neither a dirty-log ioctl nor a scan of the framebuffer.
     pub fn take_frame(&mut self) -> Option<Scanout> {
         self.pending.take()
+    }
+
+    /// The guest pages behind whatever scanout 0 is showing.
+    ///
+    /// A guest that drives virtio-gpu properly sends `TRANSFER_TO_HOST_2D`
+    /// and `RESOURCE_FLUSH` for every change, and [`take_frame`] is all a
+    /// capture needs. A guest with no virtio-gpu driver at all still has a
+    /// picture: UEFI's GOP hands the operating system a framebuffer address
+    /// which *is* this resource's backing, and the operating system writes
+    /// straight into it. Windows does exactly that — it paints its boot
+    /// screen into the GOP framebuffer and never speaks to the device
+    /// again, because after `ExitBootServices` the firmware driver that
+    /// used to forward those writes is gone.
+    ///
+    /// Handing out the backing lets the host read those pages itself. See
+    /// [`frame_from_backing`].
+    ///
+    /// [`take_frame`]: Self::take_frame
+    pub fn scanout_backing(&self) -> Option<ScanoutBacking> {
+        let resource = self.resources.get(&self.scanout_resource?)?;
+        if resource.backing.is_empty() {
+            return None;
+        }
+        Some(ScanoutBacking {
+            width: resource.width,
+            height: resource.height,
+            entries: resource.backing.clone(),
+        })
     }
 
     /// Service one chain from the control queue.
@@ -363,6 +421,37 @@ impl VirtioGpu {
         resp::OK_NODATA
     }
 
+    /// Create a resource directly, for tests that are about the transfer
+    /// path rather than about command decoding.
+    #[cfg(test)]
+    pub(crate) fn create_resource_for_test(&mut self, id: u32, width: u32, height: u32) {
+        self.resources.insert(
+            id,
+            Resource {
+                width,
+                height,
+                pixels: vec![0u8; (width * height) as usize * 4],
+                backing: Vec::new(),
+            },
+        );
+    }
+
+    /// Attach a single-entry backing list.
+    #[cfg(test)]
+    pub(crate) fn attach_backing_for_test(&mut self, id: u32, gpa: u64, len: u32) {
+        if let Some(r) = self.resources.get_mut(&id) {
+            r.backing = vec![MemEntry {
+                addr: gpa,
+                length: len,
+            }];
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resource_pixels_for_test(&self, id: u32) -> Option<&[u8]> {
+        self.resources.get(&id).map(|r| r.pixels.as_slice())
+    }
+
     fn transfer_to_host_2d<M: GuestMemory>(&mut self, mem: &M, body: &[u8]) -> u32 {
         if body.len() < 32 {
             return resp::ERR_INVALID_PARAMETER;
@@ -396,7 +485,22 @@ impl VirtioGpu {
         for line in 0..rect.height as usize {
             // Source and destination strides are both `width * 4`: the
             // guest's backing store for a 2D resource is tightly packed.
-            let src = offset as usize + (line * stride) + rect.x as usize * 4;
+            //
+            // `offset` already addresses the top-left corner of the
+            // rectangle — §5.7.6.9 defines it as where the data starts in
+            // the backing, and a driver computes it as
+            // `(y * width + x) * 4`. Adding `rect.x * 4` again counts the
+            // column twice, so every row is read from `x` pixels too far
+            // along and the left edge of the update comes from whatever
+            // followed it.
+            //
+            // With a full-width update, which is what Linux's damage merge
+            // usually produces, `x` is 0 and the bug is invisible. UEFI
+            // draws text in narrow rectangles at varying `x`, and the first
+            // screenshot of the firmware console showed it immediately:
+            // "No bootable option..." rendered as " bootable option...",
+            // each line missing a different number of leading characters.
+            let src = offset as usize + (line * stride);
             let dst = (rect.y as usize + line) * stride + rect.x as usize * 4;
             if dst + row_bytes > resource.pixels.len() {
                 break;
@@ -563,6 +667,71 @@ mod tests {
     use super::*;
     use crate::queue::{Descriptor, GuestMemory};
     use std::cell::RefCell;
+
+    /// A partial-width update must land where the guest put it, and must be
+    /// read from where the guest said it was.
+    ///
+    /// `offset` addresses the top-left corner of the rectangle already, so
+    /// adding `rect.x` to the source again reads each row `x` pixels too far
+    /// along. Linux almost always sends full-width damage, where `x` is 0 and
+    /// the error cancels; UEFI draws text in narrow rectangles and the first
+    /// firmware screenshot showed the left of every line missing.
+    #[test]
+    fn a_transfer_of_a_narrow_rectangle_reads_from_where_the_guest_said() {
+        const W: u32 = 8;
+        const H: u32 = 4;
+        // A backing store where every pixel encodes its own column, so a
+        // shifted read is visible in the value rather than only in a
+        // picture.
+        let mut backing = vec![0u8; (W * H) as usize * 4];
+        for y in 0..H as usize {
+            for x in 0..W as usize {
+                let at = (y * W as usize + x) * 4;
+                backing[at] = x as u8;
+                backing[at + 1] = y as u8;
+                backing[at + 2] = 0xC0;
+                backing[at + 3] = 0xFF;
+            }
+        }
+
+        let mem = FakeMem::new();
+        const BACKING_GPA: u64 = 0x1000;
+        mem.put(BACKING_GPA, &backing);
+
+        let mut gpu = VirtioGpu::new(W, H);
+        gpu.create_resource_for_test(1, W, H);
+        gpu.attach_backing_for_test(1, BACKING_GPA, backing.len() as u32);
+
+        // Update the two-pixel-wide column at x = 5, rows 1..3. A driver
+        // computes `offset` for that corner: (y * width + x) * 4.
+        let x = 5u32;
+        let y = 1u32;
+        let offset = u64::from((y * W + x) * 4);
+        let mut body = Vec::new();
+        body.extend_from_slice(&x.to_le_bytes());
+        body.extend_from_slice(&y.to_le_bytes());
+        body.extend_from_slice(&2u32.to_le_bytes()); // width
+        body.extend_from_slice(&2u32.to_le_bytes()); // height
+        body.extend_from_slice(&offset.to_le_bytes());
+        body.extend_from_slice(&1u32.to_le_bytes()); // resource id
+        body.extend_from_slice(&0u32.to_le_bytes()); // padding
+        assert_eq!(gpu.transfer_to_host_2d(&mem, &body), resp::OK_NODATA);
+
+        let pixels = gpu.resource_pixels_for_test(1).expect("the resource");
+        for row in 0..2u32 {
+            for col in 0..2u32 {
+                let at = (((y + row) * W + x + col) * 4) as usize;
+                assert_eq!(
+                    pixels[at],
+                    (x + col) as u8,
+                    "pixel at ({}, {}) came from the wrong column",
+                    x + col,
+                    y + row
+                );
+                assert_eq!(pixels[at + 1], (y + row) as u8, "wrong row");
+            }
+        }
+    }
 
     /// Guest memory as a flat buffer, so a command can be assembled at a
     /// known address and the response read back.

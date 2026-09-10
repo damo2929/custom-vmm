@@ -171,7 +171,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Class 03, subclass 80 (display / other). Not DISPLAY_VGA: §5.7.7
         // reserves that for the VGA-compatible variant, which this is not.
         0x00_03_80_00,
-        pci_cap::VIRTIO_ID_GPU,
+        pci_cap::MODERN_SUBSYSTEM_ID,
     );
     gpu_fn.set_bar64(0, GPU_BAR_BASE, bar_size);
     gpu_fn.add_virtio_cap(
@@ -225,6 +225,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&log),
     );
     devices.mmio_devices.push(Box::new(gpu));
+    devices.set_wall_clock(machine.wall_clock());
 
     // ---- the media plane -------------------------------------------------
     let frames = Arc::new(AtomicU64::new(0));

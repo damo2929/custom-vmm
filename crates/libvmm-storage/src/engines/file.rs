@@ -29,6 +29,8 @@ pub struct FileEngine {
     path: PathBuf,
     capacity: u64,
     block_size: u32,
+    /// Opened without write access. See [`FileEngine::open_read_only`].
+    read_only: bool,
     /// Completions waiting to be drained by the queue worker.
     completions: Mutex<Vec<Completion>>,
 }
@@ -39,6 +41,32 @@ impl FileEngine {
     /// `capacity_hint` sizes a newly created image; an existing file keeps
     /// its current length so a drive is never silently truncated.
     pub fn open(path: &Path, capacity_hint: u64, block_size: u32, target: &str) -> VmmResult<Self> {
+        Self::open_with(path, capacity_hint, block_size, target, false)
+    }
+
+    /// Open an existing image **read-only**, for optical media.
+    ///
+    /// The SCSI layer already refuses a write to an optical drive with sense
+    /// key DATA PROTECT, so this is the second of two locks on the same
+    /// door. It is worth having: the first depends on the medium being
+    /// configured correctly, and this one does not. An installer ISO opened
+    /// read-write is one misconfiguration away from being modified in place,
+    /// and the file is usually not ours to damage.
+    ///
+    /// It also refuses to create the file. There is no such thing as an
+    /// empty optical disc here — a missing ISO is a mistake, not a disc to
+    /// be formatted.
+    pub fn open_read_only(path: &Path, block_size: u32, target: &str) -> VmmResult<Self> {
+        Self::open_with(path, 0, block_size, target, true)
+    }
+
+    fn open_with(
+        path: &Path,
+        capacity_hint: u64,
+        block_size: u32,
+        target: &str,
+        read_only: bool,
+    ) -> VmmResult<Self> {
         let err = |detail: String| -> libvmm_core::VmmError {
             StorageError::EngineOpen {
                 engine: EngineKind::PureRustIoUring.as_str(),
@@ -49,10 +77,13 @@ impl FileEngine {
         };
 
         let existed = path.exists();
+        if read_only && !existed {
+            return Err(err(format!("{}: no such image", path.display())));
+        }
         let file = OpenOptions::new()
             .read(true)
-            .write(true)
-            .create(true)
+            .write(!read_only)
+            .create(!read_only)
             .truncate(false)
             .custom_flags(libc::O_CLOEXEC)
             .open(path)
@@ -91,6 +122,7 @@ impl FileEngine {
             path: path.to_path_buf(),
             capacity,
             block_size,
+            read_only,
             completions: Mutex::new(Vec::new()),
         })
     }
@@ -120,6 +152,14 @@ impl StorageEngine for FileEngine {
     }
 
     fn submit(&self, op: IoOp, lba: u64, iov: &[IoSlice], tag: u64) -> VmmResult<()> {
+        if self.read_only && matches!(op, IoOp::Write) {
+            return Err(StorageError::EngineIo {
+                op: op.as_str(),
+                lba,
+                detail: format!("{} was opened read-only", self.path.display()),
+            }
+            .into());
+        }
         let mut offset = lba * self.block_size as u64;
         let total: usize = iov.iter().map(|s| s.len).sum();
         self.check_range(lba, total.div_ceil(self.block_size as usize) as u64)?;
@@ -250,12 +290,14 @@ impl StorageEngine for FileEngine {
             });
         }
 
-        // Not a CoW filesystem. The engine is still declared snapshot-capable
-        // (§10.2), so fall back to a full copy rather than failing the backup,
-        // and say so in the manifest via the method field.
+        // Not a CoW filesystem. Reflink is an optimisation, not a
+        // prerequisite: the full copy below is the proper backup and is
+        // byte-for-byte identical to what FICLONE would have produced. It
+        // costs time and transient space, nothing else. The manifest records
+        // which of the two was used.
         let e = std::io::Error::last_os_error();
-        log::warn!(
-            "reflink of {} failed ({e}); falling back to a full copy — put drive images on XFS or Btrfs for instant snapshots",
+        log::info!(
+            "reflink of {} unavailable ({e}); taking a full copy instead — same backup, not instant",
             self.path.display()
         );
         drop(out);

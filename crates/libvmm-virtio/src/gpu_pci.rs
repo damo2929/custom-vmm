@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 
 use libvmm_core::devices::{MmioDevice, MsiSender};
 
-use crate::gpu::{Scanout, VirtioGpu, CONTROL_QUEUE, CURSOR_QUEUE};
+use crate::gpu::{Scanout, ScanoutBacking, VirtioGpu, CONTROL_QUEUE, CURSOR_QUEUE};
 use crate::mem::GuestRam;
 use crate::queue::DescriptorChain;
 use crate::transport::{Action, VirtioTransport, VIRTQ_MSI_NO_VECTOR};
@@ -56,6 +56,10 @@ pub struct SharedScanout {
     /// watching — and "the guest is drawing" is a different question from
     /// "someone is looking".
     pub flushed: std::sync::atomic::AtomicU64,
+    /// The guest pages behind the scanout, republished whenever the guest
+    /// changes them. A capture uses this to keep showing a guest that has
+    /// stopped flushing — see [`crate::gpu::frame_from_backing`].
+    pub backing: Mutex<Option<ScanoutBacking>>,
 }
 
 /// virtio-gpu as a PCI function.
@@ -71,6 +75,9 @@ pub struct VirtioGpuPci {
     scanout: Arc<SharedScanout>,
     chain: DescriptorChain,
     started: bool,
+    /// Which configuration-space function this device sits behind, so the
+    /// platform can tell it where firmware moved its BAR.
+    bdf: Option<libvmm_core::pci::Bdf>,
 }
 
 impl VirtioGpuPci {
@@ -105,6 +112,7 @@ impl VirtioGpuPci {
             scanout,
             chain: DescriptorChain::new(),
             started: false,
+            bdf: None,
         }
     }
 
@@ -117,6 +125,12 @@ impl VirtioGpuPci {
     }
 
     /// Tell the device where the guest mapped its BAR.
+    /// Bind this device to the configuration-space function it lives behind,
+    /// so the platform can follow firmware's BAR assignment.
+    pub fn set_bdf(&mut self, bdf: libvmm_core::pci::Bdf) {
+        self.bdf = Some(bdf);
+    }
+
     pub fn set_bar_base(&mut self, base: u64) {
         self.transport.bar_base = Some(base);
     }
@@ -192,6 +206,12 @@ impl VirtioGpuPci {
             // Publish a finished frame before telling the guest we are done
             // with its buffers, so a capture that wakes on the interrupt
             // cannot see the older frame.
+            if serviced {
+                if let Ok(mut slot) = self.scanout.backing.lock() {
+                    *slot = self.gpu.scanout_backing();
+                }
+            }
+
             if let Some(frame) = self.gpu.take_frame() {
                 self.scanout
                     .flushed
@@ -229,6 +249,18 @@ impl VirtioGpuPci {
 impl MmioDevice for VirtioGpuPci {
     fn name(&self) -> &'static str {
         "virtio-gpu"
+    }
+
+    fn bdf(&self) -> Option<libvmm_core::pci::Bdf> {
+        self.bdf
+    }
+
+    fn set_bar_base(&mut self, bar: usize, base: u64) {
+        // One BAR, and it is BAR 0: a virtio device puts its whole
+        // register file behind a single window.
+        if bar == 0 {
+            VirtioGpuPci::set_bar_base(self, base);
+        }
     }
 
     fn claims(&self, addr: u64) -> bool {

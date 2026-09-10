@@ -20,6 +20,8 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use crate::cloudhv::CloudHvPm;
+use crate::ich9::{self, AcpiPm};
 use crate::memory;
 use crate::pci::PciBus;
 
@@ -237,17 +239,141 @@ impl Uart16550 {
 /// So these registers are not decoration: they are how §1.3's memory map is
 /// communicated to §3.1's firmware, in the absence of the `fw_cfg` channel
 /// this hypervisor deliberately does not implement.
+/// What the guest asked the platform to do to itself.
+///
+/// The device model cannot stop the machine — only the run loop can — so it
+/// records the request and the run loop collects it. Both platforms this
+/// tree presents raise it: the ICH9 PM block through `PM1_CNT`, the
+/// hardware-reduced CloudHv block through its sleep-control register.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerEvent {
+    Off,
+    Reset,
+}
+
+/// The ACPI power-management timer.
+///
+/// Fixed by the ACPI specification at 3.579545 MHz — one third of the NTSC
+/// colour subcarrier, for reasons that stopped applying decades ago and are
+/// now load-bearing — and 24 bits wide, so it wraps every ~4.7 seconds.
+///
+/// It has to actually advance. Firmware calibrates its own delay loops
+/// against it: a stub returning a constant makes every `MicroSecondDelay`
+/// hang, and one returning a counter that runs too fast makes them all
+/// return instantly. Neither failure looks like a timer bug from outside.
+pub struct PmTimer {
+    /// When the timer started counting. The ACPI timer is free-running from
+    /// power-on and never resets, so this is fixed at construction.
+    started: std::time::Instant,
+    /// Which bits of the counter are implemented. The FADT declares this to
+    /// the guest in `TMR_VAL_EXT`, and the two must agree: an operating
+    /// system told the counter is 32 bits wide, watching a 24-bit one, sees
+    /// it stop dead every 4.7 seconds.
+    mask: u32,
+}
+
+impl Default for PmTimer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PmTimer {
+    pub const HZ: u128 = 3_579_545;
+    pub const MASK: u32 = 0x00FF_FFFF;
+    pub const MASK_32BIT: u32 = 0xFFFF_FFFF;
+
+    /// The 24-bit counter of a PIIX or ICH9 PM block.
+    pub fn new() -> Self {
+        PmTimer {
+            started: std::time::Instant::now(),
+            mask: Self::MASK,
+        }
+    }
+
+    /// The 32-bit counter, which is what `TMR_VAL_EXT` in the FADT
+    /// promises. Cloud Hypervisor's platform sets that flag, and this is
+    /// the timer that makes it true.
+    pub fn wide() -> Self {
+        PmTimer {
+            started: std::time::Instant::now(),
+            mask: Self::MASK_32BIT,
+        }
+    }
+
+    pub fn ticks(&self) -> u32 {
+        let ticks = self.started.elapsed().as_nanos() * Self::HZ / 1_000_000_000;
+        (ticks as u32) & self.mask
+    }
+}
+
+/// Where the guest's wall-clock time comes from.
+///
+/// This exists so the RTC and the guest's own paravirtual clock cannot
+/// disagree. A guest running `ptp_kvm` gets its time from
+/// `KVM_HC_CLOCK_PAIRING`, which the kernel answers out of
+/// `ktime_get_snapshot()`; if the CMOS answered out of an independent
+/// `gettimeofday` instead, the two would be two samples of two clocks, and
+/// the guest would see its RTC and its PTP source drift apart by whatever
+/// the host's NTP discipline was doing at the time. Reading both from the
+/// same place makes that structurally impossible rather than merely
+/// unlikely.
+///
+/// The unit is nanoseconds since the Unix epoch, because that is what
+/// `KVM_GET_CLOCK` reports and rounding on the way in would throw away the
+/// precision the paravirtual clock exists to provide.
+pub trait WallClock: Send + Sync {
+    fn realtime_nanos(&self) -> u128;
+}
+
+/// `CLOCK_REALTIME`, for a machine with no VM handle to ask.
+///
+/// This is the fallback, not the default choice: it is the same epoch KVM
+/// reports but a different sample, so it is right to about the resolution of
+/// the RTC and no better.
+pub struct SystemWallClock;
+
+impl WallClock for SystemWallClock {
+    fn realtime_nanos(&self) -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    }
+}
+
 pub struct Cmos {
     index: u8,
     /// Non-volatile RAM, including the memory-sizing registers.
     ram: [u8; 128],
     /// Set when the guest selects an index with NMI disabled (bit 7).
     nmi_disabled: bool,
+    /// Where the time registers get their answer. See [`WallClock`].
+    clock: Arc<dyn WallClock>,
 }
 
 impl Cmos {
     pub const INDEX_PORT: u16 = 0x70;
     pub const DATA_PORT: u16 = 0x71;
+
+    /// Status register A: divider and rate select, plus the read-only
+    /// update-in-progress bit.
+    pub const REGISTER_A: u8 = 0x0A;
+    pub const REGISTER_A_UIP: u8 = 0x80;
+    /// Status register C: interrupt flags, cleared by reading.
+    pub const REGISTER_C: u8 = 0x0C;
+    /// Status register B: the guest's declaration of how it wants the time
+    /// registers encoded.
+    pub const REGISTER_B: u8 = 0x0B;
+    /// Bit 1, "24/12": set for 24-hour hours, clear for 12-hour with the PM
+    /// flag in bit 7 of the hours register.
+    pub const REGISTER_B_24H: u8 = 0x02;
+    /// Bit 2, "DM": set for binary time registers, clear for BCD.
+    pub const REGISTER_B_BINARY: u8 = 0x04;
+    /// Status register D: bit 7 is VRT, "valid RAM and time", driven by the
+    /// battery sense circuit and read-only.
+    pub const REGISTER_D: u8 = 0x0D;
+    pub const REGISTER_D_VRT: u8 = 0x80;
 
     /// Build the CMOS for a machine with `below_4g` and `above_4g` bytes of
     /// RAM.
@@ -270,11 +396,11 @@ impl Cmos {
         // Status registers. B: 24-hour mode, binary (not BCD) values — the
         // simpler of the two encodings and the one the A/B pair advertises.
         ram[0x0A] = 0x26; // divider on, 1024 Hz rate
-        ram[0x0B] = 0x02 | 0x04; // 24-hour, binary
-        ram[0x0C] = 0x00; // no interrupt pending
-        ram[0x0D] = 0x80; // battery good
-                          // 0x0F, the shutdown status byte: 0 means a normal power-on, which
-                          // is what stops firmware from taking a resume path.
+        ram[Self::REGISTER_B as usize] = Self::REGISTER_B_24H | Self::REGISTER_B_BINARY;
+        ram[Self::REGISTER_C as usize] = 0x00; // no interrupt pending
+        ram[Self::REGISTER_D as usize] = Self::REGISTER_D_VRT; // battery good
+                                                               // 0x0F, the shutdown status byte: 0 means a normal power-on, which
+                                                               // is what stops firmware from taking a resume path.
         ram[0x0F] = 0x00;
         // Equipment byte: no floppy, 80-column display.
         ram[0x14] = 0x05;
@@ -283,7 +409,16 @@ impl Cmos {
             index: 0,
             ram,
             nmi_disabled: false,
+            clock: Arc::new(SystemWallClock),
         }
+    }
+
+    /// Take the time from `clock` instead of the host's `CLOCK_REALTIME`.
+    ///
+    /// The platform calls this once the VM handle exists, with a clock backed
+    /// by `KVM_GET_CLOCK`.
+    pub fn set_clock(&mut self, clock: Arc<dyn WallClock>) {
+        self.clock = clock;
     }
 
     /// Fill in the real-time clock registers from the host clock.
@@ -291,10 +426,13 @@ impl Cmos {
     /// Computed on read rather than stored, because a guest that reads the
     /// time twice a second apart should see it advance.
     fn time_register(&self, index: u8) -> Option<u8> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        // One sample, from which every field of this reading is derived.
+        // The MC146818 updates all its time registers together once a
+        // second, and firmware relies on that: `RtcReadTimeDateOrFail`
+        // reads seconds, then the rest, then seconds again, and treats a
+        // change as proof the reading was torn. Sampling the clock once per
+        // register would make that check fire at random.
+        let now = (self.clock.realtime_nanos() / 1_000_000_000) as u64;
         let (days, rem) = (now / 86_400, now % 86_400);
         let (hour, minute, second) = (rem / 3600, (rem % 3600) / 60, rem % 60);
         // Civil date from a Unix day number, Howard Hinnant's algorithm.
@@ -309,15 +447,44 @@ impl Cmos {
         let m = if mp < 10 { mp + 3 } else { mp - 9 };
         let y = if m <= 2 { y + 1 } else { y };
 
+        // How the guest asked for these fields. Register B is writable and
+        // firmware does write it: `PcRtcInit` clears DM, putting the chip
+        // into BCD, and answering in binary anyway hands every guest a
+        // silently wrong time. On the MC146818 the encoding is whatever
+        // register B says it is.
+        let register_b = self.ram[Self::REGISTER_B as usize];
+        let binary = register_b & Self::REGISTER_B_BINARY != 0;
+        let encode = |value: u64| -> u8 {
+            if binary {
+                value as u8
+            } else {
+                (((value / 10) << 4) | (value % 10)) as u8
+            }
+        };
+
+        // Bit 1 clear means 12-hour hours: 1..=12 with bit 7 set for PM.
+        // The PM flag sits above the encoded digits either way, so it is
+        // applied after `encode`.
+        let hours = if register_b & Self::REGISTER_B_24H != 0 {
+            encode(hour)
+        } else {
+            let pm = hour >= 12;
+            let twelve = match hour % 12 {
+                0 => 12,
+                h => h,
+            };
+            encode(twelve) | if pm { 0x80 } else { 0 }
+        };
+
         Some(match index {
-            0x00 => second as u8,
-            0x02 => minute as u8,
-            0x04 => hour as u8,
-            0x06 => (days % 7 + 1) as u8,
-            0x07 => d as u8,
-            0x08 => m as u8,
-            0x09 => (y % 100) as u8,
-            0x32 => (y / 100) as u8,
+            0x00 => encode(second),
+            0x02 => encode(minute),
+            0x04 => hours,
+            0x06 => encode(days % 7 + 1),
+            0x07 => encode(d as u64),
+            0x08 => encode(m as u64),
+            0x09 => encode((y % 100) as u64),
+            0x32 => encode((y / 100) as u64),
             _ => return None,
         })
     }
@@ -327,7 +494,27 @@ impl Cmos {
         if let Some(value) = self.time_register(index) {
             return value;
         }
-        self.ram.get(index as usize).copied().unwrap_or(0)
+        match index {
+            // Register A. UIP (bit 7) is set only while the chip is rolling
+            // the time over, and reads as clear here because the time
+            // registers are computed at the instant they are read and can
+            // never be caught half-updated. Firmware polls this bit before
+            // trusting a reading; a stored value that happened to have it
+            // set would spin until the timeout and then be reported as a
+            // broken RTC.
+            Self::REGISTER_A => self.ram[Self::REGISTER_A as usize] & !Self::REGISTER_A_UIP,
+            // Register C, the interrupt flags, is cleared by the act of
+            // reading it. No interrupt source is wired up, so it is always
+            // zero — but the read must still be destructive, because a
+            // guest that finds a latched flag it cannot clear will take it
+            // for a stuck interrupt.
+            Self::REGISTER_C => {
+                let value = self.ram[Self::REGISTER_C as usize];
+                self.ram[Self::REGISTER_C as usize] = 0;
+                value
+            }
+            _ => self.ram.get(index as usize).copied().unwrap_or(0),
+        }
     }
 
     fn write_data(&mut self, value: u8) {
@@ -338,8 +525,31 @@ impl Cmos {
         if matches!(index, 0x00 | 0x02 | 0x04 | 0x06 | 0x07 | 0x08 | 0x09 | 0x32) {
             return;
         }
-        if let Some(slot) = self.ram.get_mut(index) {
-            *slot = value;
+        match index as u8 {
+            // Register C is read-only: its flags are set by the chip and
+            // cleared by reading, never by writing.
+            Self::REGISTER_C => {}
+            // Register D is read-only too, and getting this wrong stops a
+            // UEFI boot dead. `PcRtcInit` opens by writing
+            // `PcdInitialValueRtcRegisterD`, which is **0x00** — VRT
+            // included. Store that and the very next thing the firmware
+            // does is read VRT back, find it clear, and conclude the RTC has
+            // lost its battery:
+            //
+            // ```text
+            // ASSERT_EFI_ERROR (Status = Device Error)
+            // ASSERT PcRtcEntry.c(259)
+            // ```
+            //
+            // On a real MC146818 bit 7 is driven by the battery sense
+            // circuit and a write to it does nothing at all. So this
+            // register answers a constant.
+            Self::REGISTER_D => {}
+            _ => {
+                if let Some(slot) = self.ram.get_mut(index) {
+                    *slot = value;
+                }
+            }
         }
     }
 }
@@ -455,6 +665,20 @@ pub trait MsiSender: Send + Sync {
     fn signal(&self, address: u64, data: u32);
 }
 
+/// Somewhere to publish a block of host memory as guest RAM.
+///
+/// A framebuffer BAR is the one BAR that must not trap: a guest clearing an
+/// 800x600 screen writes 480,000 pixels, and an exit per pixel is not a
+/// display, it is a stall. So the BAR is backed by a real KVM memory slot,
+/// and because firmware decides where BARs live, the slot has to follow it.
+pub trait GuestRamMapper: Send + Sync {
+    /// Publish `len` bytes of host memory at `host` as guest RAM at `gpa`,
+    /// replacing whatever `slot` held before.
+    fn remap(&self, slot: u32, gpa: u64, host: u64, len: u64) -> crate::VmmResult<()>;
+    /// Take `slot` out of the guest's address space.
+    fn unmap(&self, slot: u32) -> crate::VmmResult<()>;
+}
+
 /// An MMIO device the platform model routes to but does not know about.
 ///
 /// `DeviceModel` lives in this crate and virtio devices live above it, so
@@ -467,6 +691,36 @@ pub trait MmioDevice: Send {
     fn claims(&self, addr: u64) -> bool;
     fn read(&mut self, addr: u64, data: &mut [u8]);
     fn write(&mut self, addr: u64, data: &[u8]);
+
+    /// The configuration-space function this device is behind, if it has
+    /// one. Devices that are not on the PCI bus return `None`.
+    fn bdf(&self) -> Option<crate::pci::Bdf> {
+        None
+    }
+
+    /// Firmware reprogrammed a BAR; decode there from now on.
+    ///
+    /// A device that ignores this decodes at whatever address the platform
+    /// pre-assigned, and firmware is under no obligation to agree. edk2
+    /// does not: `PciBusDxe` re-enumerates the bus and satisfies a 64-bit
+    /// BAR above 4 GiB by preference, so a device pre-assigned at
+    /// `0xC000_0000` is moved to `0x1_0000_0000` and every access to it
+    /// then lands on an address nothing claims. The symptom is a device
+    /// that appears in the PCI listing, binds no driver, and produces not
+    /// one MMIO exit — which reads as a broken device model rather than a
+    /// disagreement about addresses.
+    fn set_bar_base(&mut self, _bar: usize, _base: u64) {}
+
+    /// The guest set or cleared the memory-space bit in the command
+    /// register.
+    ///
+    /// Devices that only answer MMIO can ignore this — an access to a
+    /// disabled device is the guest's mistake, not ours. A device whose BAR
+    /// is a real memory slot cannot: it has to publish and withdraw that
+    /// slot in step with the bit, because firmware sizes a BAR by writing
+    /// all-ones into it, and a slot that followed *that* would be mapped
+    /// over the top of the address space.
+    fn set_memory_decode(&mut self, _enabled: bool) {}
 }
 
 pub struct DeviceModel {
@@ -474,6 +728,17 @@ pub struct DeviceModel {
     pub serial: Uart16550,
     pub cmos: Cmos,
     pub ioapic: IoApic,
+    /// The ACPI power-management block behind the LPC bridge's PMBASE.
+    /// Present whether or not the bridge is: without it the block simply
+    /// never decodes, because [`ich9::pmbase`] returns `None`.
+    pub pm: AcpiPm,
+    /// The hardware-reduced ACPI registers of the chipset-free CloudHv
+    /// platform, at fixed addresses. `None` unless
+    /// [`DeviceModel::present_cloudhv_platform`] was called, because the two
+    /// platforms overlap: `0x0600` is `PM1_STS` on one and
+    /// `SLEEP_CONTROL_REG` on the other, and only the machine being built
+    /// knows which it is.
+    pub cloudhv_pm: Option<CloudHvPm>,
     log: Arc<SerialLog>,
     /// Devices claiming their own MMIO ranges, consulted before the
     /// platform's own regions.
@@ -493,6 +758,8 @@ impl DeviceModel {
             serial: Uart16550::new(Arc::clone(&log)),
             cmos: Cmos::new(below_4g, above_4g),
             ioapic: IoApic::default(),
+            pm: AcpiPm::new(),
+            cloudhv_pm: None,
             log,
             mmio_devices: Vec::new(),
             pci_config_address: 0,
@@ -504,6 +771,118 @@ impl DeviceModel {
 
     pub fn post_code(&self) -> u8 {
         self.post_code
+    }
+
+    /// Present the chipset-free CloudHv platform: hardware-reduced ACPI at
+    /// fixed I/O addresses instead of an ICH9 PM block behind a PMBASE
+    /// register. See [`crate::cloudhv`].
+    ///
+    /// This is exclusive with the ICH9 LPC bridge, and the exclusion is not
+    /// stylistic: both claim `0x0600`, and they disagree about what a write
+    /// there means.
+    pub fn present_cloudhv_platform(&mut self) {
+        // A hard assert, not a debug one. This is a bring-up-time
+        // programming error — the machine is being described wrongly — and
+        // the alternative to stopping is a platform where 0x0600 means two
+        // things: `PM1_STS`, which is write-one-to-clear, and
+        // `SLEEP_CONTROL_REG`, where the same write powers the machine off.
+        // That failure would present as a firmware that shuts the guest down
+        // while clearing a status bit, which is not a symptom anyone would
+        // trace back to here.
+        assert!(
+            ich9::pmbase(&self.pci).is_none(),
+            "the CloudHv platform and an enabled ICH9 PM block both decode \
+             0x0600 and mean different things by it"
+        );
+        self.cloudhv_pm = Some(CloudHvPm::new());
+    }
+
+    /// Point the RTC at the same clock the guest's paravirtual time comes
+    /// from. See [`WallClock`].
+    pub fn set_wall_clock(&mut self, clock: Arc<dyn WallClock>) {
+        self.cmos.set_clock(clock);
+    }
+
+    /// Take any power state change the guest asked for through the ACPI PM
+    /// block. The run loop collects this; the device model cannot stop the
+    /// machine itself.
+    pub fn take_power_event(&mut self) -> Option<PowerEvent> {
+        self.pm
+            .take_power_event()
+            .or_else(|| self.cloudhv_pm.as_mut().and_then(|p| p.take_power_event()))
+    }
+
+    /// Tell any device behind `offset`'s function where its BAR now decodes.
+    ///
+    /// Called after every configuration write that could have landed in
+    /// BAR0, because the platform is the only place that sees both the
+    /// configuration space and the device model.
+    /// A configuration-space write landed; tell the device behind it if
+    /// the write changed where it lives.
+    ///
+    /// Two registers matter. A write in the BAR range moves a window, and a
+    /// device that ignores it decodes at an address firmware has stopped
+    /// using — `PciBusDxe` re-enumerates the bus and does not feel bound by
+    /// whatever the platform pre-assigned. A write to the command register
+    /// turns decoding on or off, which is only interesting to a device
+    /// whose BAR is a real memory slot, but for that device it is the
+    /// difference between a framebuffer and a slot mapped over the top of
+    /// the address space during BAR sizing.
+    fn config_written(&mut self, ecam_offset: u64) {
+        let (bdf, register) = crate::pci::Bdf::from_ecam_offset(ecam_offset);
+        let Some(f) = self.pci.get(bdf) else { return };
+
+        if (crate::pci::COMMAND..crate::pci::COMMAND + 2).contains(&register) {
+            let enabled = f.read(crate::pci::COMMAND, 2) & 0x0002 != 0;
+            for device in &mut self.mmio_devices {
+                if device.bdf() == Some(bdf) {
+                    device.set_memory_decode(enabled);
+                }
+            }
+            return;
+        }
+
+        if !(crate::pci::BAR0..crate::pci::BAR0 + 24).contains(&register) {
+            return;
+        }
+        // Which BAR is this? Walking from BAR0 rather than dividing by four
+        // is what attributes the upper half of a 64-bit BAR to the BAR it
+        // belongs to instead of inventing one that is not there.
+        let mut index = 0usize;
+        let mut offset = crate::pci::BAR0;
+        let found = loop {
+            if offset >= crate::pci::BAR0 + 24 {
+                break None;
+            }
+            let low = f.read(offset, 4);
+            // Bit 0 selects I/O space, bits 2:1 the width, bit 3
+            // prefetchable. None of them is part of the address.
+            let io = low & 1 != 0;
+            let wide = !io && (low & 0b110) == 0b100;
+            let width = if wide { 8 } else { 4 };
+            if (offset..offset + width).contains(&register) {
+                let base = if wide {
+                    f.read(offset, 8) & !0xF
+                } else if io {
+                    low & !0x3
+                } else {
+                    low & !0xF
+                };
+                break Some((index, base));
+            }
+            offset += width;
+            index += 1;
+        };
+        let Some((bar, base)) = found else { return };
+        for device in &mut self.mmio_devices {
+            if device.bdf() == Some(bdf) {
+                log::debug!(
+                    "{}: firmware moved {bdf} BAR{bar} to {base:#x}",
+                    device.name()
+                );
+                device.set_bar_base(bar, base);
+            }
+        }
     }
 
     /// The ECAM offset the legacy `0xCF8` address register currently selects,
@@ -522,6 +901,22 @@ impl DeviceModel {
 
     pub fn io_read(&mut self, port: u16, data: &mut [u8]) {
         let len = data.len();
+        // The ACPI PM block moves: firmware programs its base into the LPC
+        // bridge's PMBASE register, so where it answers is a property of
+        // the guest's own configuration, not a constant. Resolved before
+        // the match because the fixed ports below are all constants.
+        if let Some(base) = ich9::pmbase(&self.pci) {
+            if (base..base.saturating_add(ich9::BLOCK_LEN)).contains(&port) {
+                self.pm.read(port - base, data);
+                return;
+            }
+        }
+        if let Some(pm) = self.cloudhv_pm.as_ref() {
+            if CloudHvPm::claims(port) {
+                pm.read(port, data);
+                return;
+            }
+        }
         match port {
             p if (Uart16550::BASE..Uart16550::BASE + Uart16550::LEN).contains(&p) => {
                 data[0] = self.serial.read(p - Uart16550::BASE);
@@ -579,6 +974,18 @@ impl DeviceModel {
     }
 
     pub fn io_write(&mut self, port: u16, data: &[u8]) {
+        if let Some(base) = ich9::pmbase(&self.pci) {
+            if (base..base.saturating_add(ich9::BLOCK_LEN)).contains(&port) {
+                self.pm.write(port - base, data);
+                return;
+            }
+        }
+        if let Some(pm) = self.cloudhv_pm.as_mut() {
+            if CloudHvPm::claims(port) {
+                pm.write(port, data);
+                return;
+            }
+        }
         let value = value_of(data);
         match port {
             p if (Uart16550::BASE..Uart16550::BASE + Uart16550::LEN).contains(&p) => {
@@ -627,6 +1034,7 @@ impl DeviceModel {
             p if (port::PCI_CONFIG_DATA..port::PCI_CONFIG_DATA + 4).contains(&p) => {
                 if let Some(offset) = self.cf8_target(p - port::PCI_CONFIG_DATA) {
                     self.pci.config_rw(offset, data.len(), Some(value));
+                    self.config_written(offset);
                 }
                 return;
             }
@@ -667,6 +1075,7 @@ impl DeviceModel {
         if (memory::ECAM_BASE..memory::ECAM_BASE + memory::ECAM_SIZE).contains(&addr) {
             self.pci
                 .config_rw(addr - memory::ECAM_BASE, data.len(), Some(value_of(data)));
+            self.config_written(addr - memory::ECAM_BASE);
             return;
         }
         if (IoApic::BASE..IoApic::BASE + IoApic::LEN).contains(&addr) {
@@ -782,6 +1191,69 @@ mod tests {
         };
         let decoded = ((byte(0x5D) << 16) | (byte(0x5C) << 8) | byte(0x5B)) << 16;
         assert_eq!(decoded, above);
+    }
+
+    #[test]
+    fn the_time_registers_are_encoded_the_way_register_b_says() {
+        // A clock stopped at a moment whose fields are unambiguous: every
+        // one of them has a different value in binary and in BCD.
+        struct Fixed;
+        impl WallClock for Fixed {
+            fn realtime_nanos(&self) -> u128 {
+                // 2026-09-10T18:20:29Z.
+                1_789_064_429u128 * 1_000_000_000
+            }
+        }
+
+        let mut cmos = Cmos::new(1024 * memory::MIB, 0);
+        cmos.set_clock(Arc::new(Fixed));
+        let field = |cmos: &mut Cmos, index: u8| {
+            cmos.index = index;
+            cmos.read_data()
+        };
+
+        // As built: binary, which is what register B advertises out of
+        // reset.
+        assert_eq!(
+            [
+                field(&mut cmos, 0x00),
+                field(&mut cmos, 0x02),
+                field(&mut cmos, 0x04),
+                field(&mut cmos, 0x07),
+                field(&mut cmos, 0x08),
+                field(&mut cmos, 0x09),
+            ],
+            [29, 20, 18, 10, 9, 26],
+            "binary, because register B says DM is set"
+        );
+
+        // What `PcRtcInit` does: write register B with DM clear, putting
+        // the chip into BCD. Answering in binary after that hands the guest
+        // 2020-09-10T12:20:29 instead — which is how Windows' boot loader
+        // came to fail with STATUS_IO_DEVICE_ERROR.
+        cmos.index = Cmos::REGISTER_B;
+        cmos.write_data(Cmos::REGISTER_B_24H);
+        assert_eq!(
+            [
+                field(&mut cmos, 0x00),
+                field(&mut cmos, 0x02),
+                field(&mut cmos, 0x04),
+                field(&mut cmos, 0x07),
+                field(&mut cmos, 0x08),
+                field(&mut cmos, 0x09),
+            ],
+            [0x29, 0x20, 0x18, 0x10, 0x09, 0x26],
+            "BCD, because register B says DM is clear"
+        );
+
+        // 12-hour mode: 18:00 is 6 PM, and the PM flag rides in bit 7 above
+        // the encoded digits.
+        cmos.index = Cmos::REGISTER_B;
+        cmos.write_data(0);
+        assert_eq!(field(&mut cmos, 0x04), 0x80 | 0x06, "6 PM in BCD");
+        cmos.index = Cmos::REGISTER_B;
+        cmos.write_data(Cmos::REGISTER_B_BINARY);
+        assert_eq!(field(&mut cmos, 0x04), 0x80 | 6, "6 PM in binary");
     }
 
     #[test]

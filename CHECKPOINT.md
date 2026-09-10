@@ -4,7 +4,288 @@ Resume point. Written to be read cold: it assumes only
 [README.md](README.md) and [AGENTS.md](AGENTS.md).
 
 **Tree state: green.** `cargo build --workspace` clean, `cargo clippy
---workspace --all-targets` zero warnings, **427 tests passing**.
+--workspace --all-targets` zero warnings, **465 tests passing**. Built with
+`-C target-cpu=x86-64-v3` (checked in at `.cargo/config.toml`; see
+[HOST-REQUIREMENTS.md](HOST-REQUIREMENTS.md)).
+
+---
+
+## There is a linear framebuffer now, and a real installer draws on it
+
+The live command:
+
+```sh
+cargo build --release --example install_boot
+RUST_LOG=info ./target/release/examples/install_boot firmware/CLOUDHV.fd \
+  /home/damien/Downloads/proxmox-ve_9.2-1.iso 60 /tmp/shot.ppm
+```
+
+That produces the Proxmox VE 9.2 installer's GRUB menu in colour at
+1024x768 — the guest set the mode itself through the VBE dispi registers and
+painted straight into the framebuffer, and the host read it back out of the
+mapping. `RUST_LOG=info,libvmm_core::vcpu=trace` logs every port and MMIO
+exit with its data, which is the instrument that found everything below.
+
+**The device** is `crates/libvmm-core/src/display.rs`, Revision D.10: the
+Bochs VBE display at `1234:1111`, bound by edk2's stock `QemuVideoDxe`.
+BAR 0 is the framebuffer and is a **KVM memory slot**, not a trapping MMIO
+region — an exit per pixel is not a display. The slot follows the BAR and is
+published only while the command register's memory-space bit is set.
+
+`VirtioGpuDxe` is deliberately **not** in the firmware any more. Its GOP is
+`PixelBltOnly` with no `FrameBufferBase`, so it stops working at
+`ExitBootServices`; and with both drivers present the firmware publishes two
+graphics protocols and the guest picks one. virtio-gpu is still on the bus
+for guests that drive it themselves.
+
+## Windows 11 boots off our DVD and then stops before it draws
+
+**Where it gets to.** BDS loads and starts `bootmgfw.efi` from
+`PciRoot(0x0)/Pci(0x2,0x0)/Scsi(0x0,0x0)`, Windows reads **516 MiB** off the
+DVD through our virtio-scsi — that is `boot.wim` going into a RAM disk,
+which is why no Windows storage driver is needed afterwards — calls
+`ExitBootServices`, programs all 24 I/O APIC redirection entries, re-walks
+ECAM, and then does nothing but poll the ACPI timer at `0x0608`. It never
+paints, on either surface.
+
+**Not the display.** The same firmware and the same framebuffer render the
+Proxmox installer above. Windows reaches `ExitBootServices` and stops for
+another reason.
+
+**What it is doing while it does nothing.** `RUST_LOG=libvmm_core::vcpu=trace`
+now logs the instruction pointer at every exit. Windows sits at
+`rip 0xfffff802bdb239d5` — kernel space — in a four-instruction loop reading
+the ACPI timer. The timer itself is fine: the values are monotonic and
+advance about 34 ticks per read, which is 9.5 µs at 3.579545 MHz, the cost
+of the exit. So the guest is running, has a working clock, and is waiting
+for something that never comes.
+
+**The FADT was wrong, has been fixed (D.11), and was not the cause.** It
+declared itself not hardware-reduced and then supplied none of what that
+implies: no FACS, no PM timer, a `PM1a_EVT_BLK` at `0x05FC` that nothing
+decoded, a `PM1a_CNT_BLK` pointing at `0x0600` — which on this platform is
+`SLEEP_CONTROL_REG` and means something else — and `RESET_REG_SUP` set with
+nothing decoding `0x0CF9`. It now says `HW_REDUCED_ACPI | RESET_REG_SUP |
+TMR_VAL_EXT` with the sleep pair, a 32-bit `X_PM_TMR_BLK`, and PM1 blocks at
+`0x060C`/`0x0610` that `CloudHvPm` answers, following Cloud Hypervisor,
+which boots Windows on this same firmware. Windows behaves identically.
+
+**What has not been tried yet**, roughly in order of what a Windows bugcheck
+this early usually means:
+
+1. **CPUID.** Windows 11 refuses a processor missing what it requires and
+   bugchecks `0x5D UNSUPPORTED_PROCESSOR` before it has a screen. Check what
+   `KVM_SET_CPUID2` actually leaves the guest — NX, SSE4.2, POPCNT,
+   CMPXCHG16B, PrefetchW, LAHF/SAHF in long mode, and the invariant-TSC bit
+   in `0x8000_0007`.
+2. **The bugcheck is invisible, and that is fixable.** Windows paints a
+   bugcheck through bootvid into the framebuffer it was given. Nothing has
+   painted, so either it crashed before display init or it never got a
+   framebuffer. Confirm which by checking whether `winload` was handed a
+   `PixelBlueGreenRedReserved8BitPerColor` GOP at all.
+3. **Windows' own debug output.** The install media's BCD can be edited on a
+   writable copy of the ISO to turn on `bootdebug`/`bootlog`, which would
+   say what it is waiting for rather than leaving it to inference.
+
+**Fixed on the way here**, all with regression tests:
+
+* **The RTC answered in the wrong encoding.** `PcRtcInit` writes register B
+  with `Dm = 0` — BCD — and `Cmos::time_register` kept answering in binary,
+  so Windows read 2020-09-10 12:10:35 instead of 2026-09-10 18:16:53 and
+  `BlInitializeLibrary` failed with `0xc0000185`, which is
+  `STATUS_IO_DEVICE_ERROR`, which is what bootlib maps `EFI_DEVICE_ERROR`
+  to. That string is in `efi/boot/bootx64.efi` on the ISO as UTF-16 and
+  nowhere in `CLOUDHV.fd`, so it was Windows' own loader saying it.
+* **A BAR's type bits are read-only and we were letting the guest clear
+  them.** Firmware writes the bare address — `reg 0x10 <- 0x00008000` — and
+  storing that verbatim turned a 64-bit BAR into something that read back as
+  32-bit. The following write to `0x14` was then attributed to a BAR that
+  does not exist, and the device never learned it had moved to
+  `0x1_0000_8000`. Symptom: `mmio 0x0100008014 x64` unanswered, and a
+  virtio-scsi the firmware enumerates and will not talk to.
+* **The upper half of a 64-bit BAR sized as an unimplemented BAR**, reading
+  back zero instead of the top of the mask, which for any region under 4 GiB
+  is all-ones.
+
+**What is proven working on the storage path**, and should not be re-tested
+from scratch:
+
+* Booting from optical media. The UEFI Shell ISO reaches an interactive
+  `Shell>` at `PciRoot(0x0)/Pci(0x2,0x0)/Scsi(0x0,0x0)/CDROM(0x0)`, and
+  Proxmox VE reaches its installer menu.
+* One virtio-scsi HBA per drive, a request queue per vCPU, a worker thread
+  per queue named `{controller}-q{k}`.
+* CD/DVD/BD-ROM media (peripheral type 0x05, 2048-byte blocks, the MMC
+  command set, writes refused with DATA PROTECT) and SSD media (type 0x00,
+  VPD 0xB1 rotation rate 1, TRIM/UNMAP).
+* A megabyte read spanning many descriptors, byte-compared against the ISO.
+
+**One number worth knowing.** A guest sitting at a boot menu takes about
+200,000 exits a second, essentially all of them reads of `0x03FD`, the
+16550 line-status register: GRUB polling for a keystroke that cannot arrive,
+because there is no input device. That is priority 3 arriving early.
+
+## The machine has no chipset, and UEFI boots on it anyway
+
+**Revision D.2 is decided: option B.** The machine is a PCIe root complex and
+nothing else — one PCI function at 00:00.0 with the CloudHv host bridge ID
+`8086:0d57`, two fixed I/O registers, and no LPC bridge, no PMBASE, no
+`fw_cfg`, no A20 gate, no PIC and no PIT.
+
+```sh
+scripts/build-cloudhv-firmware.sh          # once; no root needed
+cargo run --release -p custom-vmm --example cloudhv_boot -- firmware/CLOUDHV.fd
+```
+
+A `DEBUG` build of that firmware confirms which path it took, in its own
+words, and then enumerates our bus and reaches BDS:
+
+```text
+PlatformMiscInitialization: Cloud Hypervisor is done.
+PciHostBridgeUtilityInitRootBridge: populated root bus 0, with room for 255 subordinate bus(es)
+PciBus: Discovered PCI @ [00|00|00]  [VID = 0x8086, DID = 0x0D57]
+  Boot0000: BootManagerMenuApp
+  Boot0001: EFI Firmware Setup
+  Boot0002: EFI Internal Shell
+BdsDxe: No bootable option or device was found.
+```
+
+The entire unhandled-access report for a complete UEFI boot is **two
+entries** — `port 0x0021 x1` and `port 0x00a1 x1`, the 8259 masks, written
+once by a firmware masking a PIC that is not there. That is the whole cost of
+having no chipset, and it is *fewer* unanswered accesses than the Q35 path.
+
+Nothing was added to the VMM to feed this firmware. `CLOUDHV.fd` is an
+**ELF** — `OvmfPkg/CloudHv` builds with `OvmfPkg/XenResetVector` and carries
+an `XEN_ELFNOTE_PHYS32_ENTRY` note — so it loads through the *same PVH
+loader that loads a Linux kernel*, unchanged, and then takes its memory map
+from `hvm_start_info.memmap_paddr` and its ACPI tables from the XSDT behind
+`rsdp_paddr`. Both are structures this tree already built.
+
+Written up as [Revision D.9](docs/spec-revision-D-boot-and-platform.md).
+Three known issues are recorded there, none fatal:
+
+* a non-fatal `EFI_MEMORY_UC` complaint from `PciHostBridgeDxe`;
+* edk2's CloudHv 32-bit aperture overlapping the D.5 ECAM window — harmless
+  at the current device count, and the fix is to shrink the aperture, not to
+  move ECAM;
+* **SMBIOS is not presented, and `CLOUDHV_SMBIOS_ADDRESS` is `0x000F_0000` —
+  the same address as §3.3's ACPI staging area.** Harmless today (the driver
+  correctly reports `Not Found`), but §3.2's SMBIOS builder cannot be staged
+  there without moving the ACPI tables first, and doing it anyway would
+  corrupt them silently.
+
+### Regenerating the firmware
+
+No distribution ships `CLOUDHV.fd`, so it is built. `scripts/build-cloudhv-firmware.sh`
+needs no root: where `nasm` and `iasl` are missing it downloads the RPMs as
+an ordinary user and unpacks them into its own work directory. It pins the
+edk2 revision, verifies the output is an ELF before installing it, and takes
+under a minute on a warm tree. See [firmware/README.md](firmware/README.md).
+The `.fd` is a build artifact and is not tracked; the recipe is.
+
+---
+
+## Stock Fedora OVMF also boots to the UEFI Boot Manager
+
+This is **Revision D.2 option A**, kept working as the alternative to the
+decision above: the distribution's own firmware, unmodified. Not a build of
+ours, not a patched image — `/usr/share/edk2/ovmf/OVMF_CODE.fd` as `dnf`
+installed it. It needs the ICH9 LPC stub (D.6) that option B does without.
+
+```sh
+cargo run --release -p custom-vmm --example ovmf_boot -- \
+    /usr/share/edk2/ovmf/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_VARS.fd 25
+```
+
+It reaches the end of BDS and says so:
+
+```text
+[Bds] Expand \EFI\BOOT\BOOTX64.EFI -> <null string>
+[Bds] Unable to boot!
+BdsDxe: No bootable option or device was found.
+BdsDxe: Press any key to enter the Boot Manager Menu.
+```
+
+That is the correct ending for a machine with no disk. Everything before it
+— SEC, PEI, the DXE dispatcher, ~40 drivers, the variable store, the GCD,
+MpInitLib, the serial and RTC drivers, BDS — ran.
+
+What nothing answered, at the end of a full boot:
+
+```text
+port 0x02ff x54     port 0x0064 x22    port 0x0060 x11
+port 0x0092 x2      port 0x0021 x1     port 0x00a1 x1
+mmio 0x00ffe00010 x2   mmio 0x00ffe20010 x2
+```
+
+0x60/0x64 is the i8042; §1.4 forbids it and virtio-input replaces it.
+0x21/0xa1 is the 8259 mask, written once and never read. The two MMIO
+addresses are writes into the flash variable store, which is mapped
+read-only — the reason the boot order is not persisted between runs.
+
+### Four things had to be right, and each was found by running it
+
+Written up in full as [Revision D.5–D.8](docs/spec-revision-D-boot-and-platform.md);
+in short:
+
+1. **ECAM moved to `0xE000_0000`** (D.5). edk2 does not read the MMCONFIG
+   base from the host bridge, it *writes* `PcdPciExpressBaseAddress` —
+   fixed at `0xE0000000` in every Q35 build — and proceeds. The reference
+   host's own firmware puts its ECAM at exactly the same address, so
+   mirroring the live machine and satisfying the firmware are one change.
+   Symptom before the fix: PEI fine (it uses `0xCF8`/`0xCFC`), then DXE
+   switched to ECAM, read zeros, computed an ACPI timer at port `0x0008`,
+   and spun — **4,514,549 unanswered reads in twenty seconds, no message.**
+2. **An ICH9 LPC bridge at 00:1f.0** (D.6), in `libvmm-core/src/ich9.rs`.
+   `AcpiTimerLibConstructor` reads `PMBASE` and `ACPI_CNTL` from that
+   function before the firmware emits a single line; absent, both read
+   all-ones and it asserts on a misaligned timer port. This is a register
+   file with a device ID — no LPC bus, no PIC, no PIT, no INTx.
+3. **CMOS registers C and D are read-only** (D.8). `PcRtcInit` opens by
+   writing register D = `0x00`, VRT included; a CMOS that stores that
+   answers the next read with VRT clear and the firmware declares the RTC
+   dead (`ASSERT PcRtcEntry.c(259)`). On real silicon that bit is driven
+   by the battery sense circuit and the write does nothing.
+4. **The RTC reads the clock KVM gives the guest** (D.7). `KVM_GET_CLOCK`
+   with `KVM_CLOCK_REALTIME` is the same `ktime_get_snapshot()` pairing
+   `ptp_kvm` answers `KVM_HC_CLOCK_PAIRING` from, so the guest's RTC and
+   its PTP source cannot drift apart. Confirmed live:
+
+   ```text
+   INFO libvmm_core::kvm::live] RTC clock source: KVM_GET_CLOCK realtime
+       — the same ktime_get_snapshot() pairing the guest's ptp_kvm reads
+   ```
+
+   The fallback matters: KVM publishes no realtime pairing until its master
+   clock is up, so a probe at bring-up always reports the fallback. The
+   source is announced on first use and on change, never at construction.
+
+### What is left before an OS boots
+
+* **A disk.** virtio-blk on the transport in `libvmm-virtio/src/transport.rs`.
+  This is now the single thing between here and installing an OS.
+* **A writable variable store**, so the boot order survives a reboot.
+* **virtio-input** (keyboard, tablet) — priority 3, and what makes the boot
+  manager usable rather than merely visible.
+
+### The host bridge identity — decided
+
+This section previously left the question open. It is now **option B**; the
+reasoning and the evidence are in D.9, and what follows is kept because the
+three options are still the right frame for revisiting it.
+
+
+Revision D.2 is now a three-way question, restated at the end of that
+document with the evidence. Briefly: 45 files in `OvmfPkg` branch on the
+host bridge device ID and **nine of them `ASSERT(FALSE)` on one they do not
+recognise**. Stock OVMF knows four: i440FX (excluded by §1.4), Q35 MCH,
+CloudHv and bhyve. **A** — Q35 MCH plus the D.6 LPC stub — boots, and is what
+this section describes. **B** — the CloudHv identity `8086:0d57`, no chipset
+at all — is **chosen, implemented and booting**; see the top of this file.
+**C** — the reference host's real root complex, AMD Krackan `1022:1122` —
+needs either our own firmware or nine patched edk2 sites, and is not
+currently pursued.
 
 ---
 
@@ -101,7 +382,7 @@ Linux version 7.1.13 ...
 Hypervisor detected: KVM
 ACPI: RSDP 0x00000000000E0000 000024 (v02 RUSTVM)
 ACPI: Interpreter enabled
-PCI: ECAM [mem 0xc0000000-0xcfffffff] reserved as E820 entry
+PCI: ECAM [mem 0xe0000000-0xefffffff] reserved as E820 entry
 PCI host bridge to bus 0000:00
 APIC: Switch to symmetric I/O mode setup
 APIC: Switched APIC routing to: physical x2apic

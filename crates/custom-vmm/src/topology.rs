@@ -102,9 +102,19 @@ pub fn plan(cfg: &MachineConfig) -> Vec<Device> {
         });
     }
 
-    if !cfg.storage.drives.is_empty() {
+    // §5.1 / Revision E: one virtio-scsi controller **per drive**, each with
+    // one request queue per vCPU and one worker thread per request queue.
+    //
+    // A single HBA carrying every drive as a target would also be valid SCSI
+    // and would use fewer PCI slots, but it would make every drive share one
+    // set of queues and one set of workers. Per-drive controllers mean an
+    // optical drive being polled cannot delay the SSD an installer is
+    // writing to, and that a slow backing store is isolated to its own
+    // drive. The slot is the drive id, so a drive keeps its address across
+    // reboots and across configuration changes to the other drives.
+    for drive in &cfg.storage.drives {
         devices.push(Device {
-            bdf: Bdf::new(cfg.storage.bus, 0x00, 0),
+            bdf: Bdf::new(cfg.storage.bus, drive.drive_id as u8, 0),
             name: "virtio-scsi",
             virtio_id: Some(pci_cap::VIRTIO_ID_SCSI),
             queues: libvmm_storage::total_queues(vcpus),
@@ -249,10 +259,11 @@ pub fn thread_plan(cfg: &MachineConfig) -> Vec<String> {
     for i in 0..n {
         threads.push(format!("vcpu-{i}"));
     }
-    // §5.1: request queue k is served by scsi-q-k, pinned with vcpu-k.
-    if !cfg.storage.drives.is_empty() {
+    // §5.1 / Revision E: request queue k of drive d is served by
+    // `scsi{d}-q{k}`, pinned with vcpu-k. One worker per queue per drive.
+    for drive in &cfg.storage.drives {
         for i in 0..n {
-            threads.push(format!("scsi-q-{i}"));
+            threads.push(format!("scsi{}-q{i}", drive.drive_id));
         }
     }
     threads.extend(libvmm_net::thread_names(&cfg.network));

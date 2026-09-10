@@ -3,5 +3,8 @@
 *.vmbk
 
 # Written by scripts/setup-local-sysroot.sh; machine-specific.
-.cargo/config.toml
 .sysroot/
+
+# Built by scripts/build-cloudhv-firmware.sh: 4 MiB and reproducible, so the
+# recipe is tracked and the artifact is not. firmware/README.md stays.
+firmware/*.fd

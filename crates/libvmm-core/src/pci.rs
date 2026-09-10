@@ -85,9 +85,14 @@ pub struct PciFunction {
     space: [u8; CONFIG_SPACE_SIZE],
     /// Per-BAR size, used to answer the write-all-ones sizing probe.
     bar_sizes: [u64; 6],
+    /// Which BAR slots are the *low* half of a 64-bit BAR, so the slot
+    /// above them is its upper half rather than a BAR of its own.
+    bar_wide: [bool; 6],
     /// Offset of the last capability emitted, so the next one can be chained.
     last_cap: Option<u8>,
     next_cap_offset: u8,
+    /// Cleared by [`PciFunction::without_capabilities`]; see there.
+    capabilities_allowed: bool,
 }
 
 impl PciFunction {
@@ -103,8 +108,10 @@ impl PciFunction {
             bdf,
             space: [0u8; CONFIG_SPACE_SIZE],
             bar_sizes: [0; 6],
+            bar_wide: [false; 6],
             last_cap: None,
             next_cap_offset: FIRST_CAP_OFFSET,
+            capabilities_allowed: true,
         };
         f.write_u16(VENDOR_ID, vendor_id);
         f.write_u16(DEVICE_ID, device_id);
@@ -124,15 +131,82 @@ impl PciFunction {
         f
     }
 
+    /// Drop the capability list.
+    ///
+    /// Capabilities start at 0x40 by convention, and on most functions that
+    /// region is free. On some it is not: the ICH9 LPC bridge puts PMBASE at
+    /// 0x40 and ACPI_CNTL at 0x44, and firmware reads them as plain
+    /// registers. A function cannot offer both, so this says which it is.
+    #[must_use]
+    pub fn without_capabilities(mut self) -> Self {
+        self.write_u16(STATUS, 0);
+        self.write_u8(CAPABILITY_LIST, 0);
+        self.capabilities_allowed = false;
+        self
+    }
+
+    /// Override the header type byte.
+    ///
+    /// The only value that differs in practice is bit 7, which marks a
+    /// multi-function device. Firmware that finds function 0 without it does
+    /// not probe functions 1..7 at all.
+    #[must_use]
+    pub fn with_header_type(mut self, header_type: u8) -> Self {
+        self.write_u8(HEADER_TYPE, header_type);
+        self
+    }
+
+    /// Write a raw configuration-space dword, for registers this module does
+    /// not otherwise name.
+    pub fn write_config_u32(&mut self, offset: usize, value: u32) {
+        self.write_u32(offset, value);
+    }
+
     /// Program a 64-bit memory BAR. `size` must be a power of two.
+    ///
+    /// **Not prefetchable.** Prefetchable is a promise that reads have no
+    /// side effects and may be merged or speculated, and a virtio BAR breaks
+    /// that promise in its second register file: reading the ISR *clears*
+    /// it (virtio 1.x §4.1.4.5). Marking it prefetchable would be a lie the
+    /// hardware is entitled to act on.
+    ///
+    /// It also placed the device out of reach. edk2's PciBusDxe combines
+    /// prefetchable 64-bit BARs and satisfies them above 4 GiB by
+    /// preference:
+    ///
+    /// ```text
+    ///   Base = 0x100000000;  Length = 0x8000;  Owner = PCI [00|01|00:10]; Type = PMem64
+    /// ```
+    ///
+    /// — which on a machine with nothing mapped above 4 GiB means the
+    /// firmware enumerated the device, assigned it an address that decodes
+    /// nowhere, and then never touched it again. Zero MMIO exits, no driver
+    /// bound, and a disk that is present in the PCI listing and absent from
+    /// the boot menu.
     pub fn set_bar64(&mut self, index: usize, base: u64, size: u64) {
         debug_assert!(index < 5, "a 64-bit BAR occupies two slots");
         debug_assert!(size.is_power_of_two());
         // bit 0 = 0 (memory), bits 2:1 = 10b (64-bit), bit 3 = prefetchable.
-        let low = ((base & 0xFFFF_FFF0) as u32) | 0b0100 | 0b1000;
+        let low = ((base & 0xFFFF_FFF0) as u32) | 0b0100;
         let high = (base >> 32) as u32;
         self.write_u32(BAR0 + index * 4, low);
         self.write_u32(BAR0 + (index + 1) * 4, high);
+        self.bar_sizes[index] = size;
+        self.bar_wide[index] = true;
+    }
+
+    /// A 32-bit memory BAR.
+    ///
+    /// Not just a narrower `set_bar64`: the width decides where firmware
+    /// can put the window. `PciBusDxe` satisfies 64-bit BARs above 4 GiB by
+    /// preference, and a framebuffer BAR that lands there is a framebuffer
+    /// the 32-bit stretches of firmware and early boot code cannot reach.
+    pub fn set_bar32(&mut self, index: usize, base: u64, size: u64) {
+        debug_assert!(index < 6);
+        debug_assert!(size.is_power_of_two());
+        debug_assert!(base <= u64::from(u32::MAX), "a 32-bit BAR cannot say that");
+        // bit 0 = 0 (memory), bits 2:1 = 00b (32-bit), bit 3 = prefetchable.
+        self.write_u32(BAR0 + index * 4, (base & 0xFFFF_FFF0) as u32);
         self.bar_sizes[index] = size;
     }
 
@@ -180,6 +254,13 @@ impl PciFunction {
 
     /// Reserve `len` bytes for a capability and chain it to the previous one.
     fn begin_cap(&mut self, cap_id: u8, len: u8) -> u8 {
+        assert!(
+            self.capabilities_allowed,
+            "{}: a capability was added to a function whose 0x40.. region \
+             holds real registers; one of the two would silently overwrite \
+             the other",
+            self.bdf
+        );
         let at = self.next_cap_offset;
         self.space[at as usize] = cap_id;
         self.space[at as usize + 1] = 0; // cap_next: patched when the next one lands
@@ -215,6 +296,66 @@ impl PciFunction {
                     self.write_u32(offset, (mask & !0xF) | kept);
                     return;
                 }
+                // An unimplemented BAR is hardwired to zero (PCI 3.0
+                // §6.2.5.1). Storing the probe value instead makes it read
+                // back as all-ones, and firmware then decodes bit 0 as "I/O
+                // space" and the width as four bytes:
+                //
+                //   BAR[1]: Type = Io32; Alignment = 0x3; Length = 0x4
+                //
+                // — five phantom I/O BARs per function, which edk2's
+                // PciBusDxe then tries to allocate I/O space for. It fails,
+                // and the *driver never binds*, so the device is enumerated
+                // and then silently unused. That is what this looked like:
+                // a virtio-scsi controller the firmware could see and would
+                // not talk to.
+                //
+                // The high half of a 64-bit BAR is *not* an unimplemented
+                // BAR, and answering zero there is its own bug. The probe
+                // reads back a 64-bit mask, and for any region smaller than
+                // 4 GiB its upper half is all-ones. Answering zero makes
+                // firmware read the mask as `0x00000000_FFFFC000`, whose
+                // complement is not a size at all — edk2 then places the
+                // window somewhere the device is not, and the symptom is
+                // MMIO at an address nothing claims:
+                //
+                //   mmio 0x0100008014 x64
+                //
+                // — the guest talking to a virtio-gpu that believes it
+                // lives at `0xC000_0000`.
+                if index > 0 && self.bar_wide[index - 1] {
+                    let size = self.bar_sizes[index - 1];
+                    let mask = if size == 0 {
+                        0
+                    } else {
+                        ((!(size - 1)) >> 32) as u32
+                    };
+                    self.write_u32(offset, mask);
+                    return;
+                }
+                self.write_u32(offset, 0);
+                return;
+            }
+
+            // An ordinary address write. The low four bits of a BAR — the
+            // space bit, the width, and prefetchable — are hardwired, and
+            // so are the address bits below the region size. Firmware
+            // writes the address alone and expects the device to keep the
+            // rest:
+            //
+            //   reg 0x10 <- 0x00008000     the address, no type bits
+            //   reg 0x14 <- 0x00000001     the upper half
+            //
+            // Storing that verbatim turns a 64-bit BAR into something that
+            // reads back as 32-bit, and then the write to `0x14` is not the
+            // upper half of anything — it is a BAR of its own that nothing
+            // implements. The device is left believing it still lives where
+            // it was pre-assigned while the guest talks to it 4 GiB away.
+            if let Some(size) = self.bar_sizes.get(index).copied().filter(|s| *s != 0) {
+                let kept = self.read(offset, 4) as u32 & 0xF;
+                let readonly = ((size - 1) & 0xFFFF_FFFF) as u32;
+                self.write_u32(offset, ((value as u32) & !readonly) | kept);
+                return;
             }
         }
         for i in 0..len.min(8) {
@@ -326,6 +467,52 @@ mod tests {
     }
 
     #[test]
+    fn the_upper_half_of_a_sixty_four_bit_bar_sizes_as_part_of_it() {
+        let mut f = PciFunction::new(Bdf::new(1, 0, 0), 0x1AF4, 0x1050, 0x030000, 0x0040);
+        f.set_bar64(0, 0xC000_0000, 0x4000); // 16 KiB
+        f.write(BAR0, 4, 0xFFFF_FFFF);
+        f.write(BAR0 + 4, 4, 0xFFFF_FFFF);
+        let probed = f.read(BAR0, 8);
+        assert_eq!(
+            probed & !0xF,
+            (!(0x4000u64 - 1)) & !0xF,
+            "the probe reads back one 64-bit mask, not a 32-bit one and a zero"
+        );
+        assert_eq!(
+            f.read(BAR0 + 4, 4),
+            0xFFFF_FFFF,
+            "every region smaller than 4 GiB has an all-ones upper mask"
+        );
+
+        // And BAR1 is not a BAR: it is this one's upper half, so firmware
+        // must be able to write an address into it.
+        f.write(BAR0, 4, 0x0000_0004);
+        f.write(BAR0 + 4, 4, 0x0000_0001);
+        assert_eq!(f.read(BAR0, 8) & !0xF, 0x1_0000_0000);
+    }
+
+    #[test]
+    fn a_bars_type_bits_survive_the_address_firmware_writes_into_it() {
+        let mut f = PciFunction::new(Bdf::new(1, 0, 0), 0x1AF4, 0x1050, 0x030000, 0x0040);
+        f.set_bar64(0, 0xC000_0000, 0x4000);
+
+        // What edk2 actually writes: the address, and nothing else.
+        f.write(BAR0, 4, 0x0000_8000);
+        f.write(BAR0 + 4, 4, 0x0000_0001);
+
+        assert_eq!(
+            f.read(BAR0, 4) & 0xF,
+            0b0100,
+            "still a 64-bit memory BAR after firmware wrote a bare address"
+        );
+        assert_eq!(
+            f.read(BAR0, 8) & !0xF,
+            0x1_0000_8000,
+            "and the two halves are one address"
+        );
+    }
+
+    #[test]
     fn bar_sizing_probe_returns_the_region_size_mask() {
         let mut f = PciFunction::new(Bdf::new(1, 0, 0), 0x1AF4, 0x1050, 0x030000, 0x0040);
         f.set_bar64(0, 0xD000_0000, 0x4000); // 16 KiB
@@ -333,6 +520,10 @@ mod tests {
         let probed = f.read(BAR0, 4) as u32;
         // Low 4 bits are type flags; the rest is ~(size-1).
         assert_eq!(probed & !0xF, (!(0x4000u32 - 1)) & !0xF);
-        assert_eq!(probed & 0xF, 0b1100); // 64-bit, prefetchable
+        // 64-bit and *not* prefetchable: prefetchable promises that a read
+        // has no side effects, and virtio's ISR register is read-to-clear.
+        // It also decides where firmware puts the window — edk2 satisfies
+        // prefetchable 64-bit BARs above 4 GiB by preference.
+        assert_eq!(probed & 0xF, 0b0100);
     }
 }

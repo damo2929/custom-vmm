@@ -67,6 +67,14 @@ impl QuiesceOutcome {
 /// Returns the drives that will be captured.
 pub fn preflight(cfg: &MachineConfig) -> Result<Vec<&Drive>, BackupError> {
     for d in &cfg.storage.drives {
+        // An optical drive is read-only external media, not machine state.
+        // Its ISO cannot change, so a backup of it is identical every time
+        // — and a Windows installer image is several gigabytes of it. It is
+        // excluded from the backup set, and its engine is therefore not
+        // required to be snapshot-capable.
+        if d.medium.is_optical() {
+            continue;
+        }
         if !d.engine.is_snapshot_capable() {
             return Err(BackupError::EngineNotSnapshotCapable {
                 drive_id: d.drive_id,
@@ -88,7 +96,12 @@ pub fn preflight(cfg: &MachineConfig) -> Result<Vec<&Drive>, BackupError> {
             engine: cfg.tpm.storage.engine.as_str(),
         });
     }
-    Ok(cfg.storage.drives.iter().collect())
+    Ok(cfg
+        .storage
+        .drives
+        .iter()
+        .filter(|d| !d.medium.is_optical())
+        .collect())
 }
 
 /// Which engines in a machine cannot snapshot, for the pre-emptive warning
@@ -97,7 +110,7 @@ pub fn non_snapshot_drives(cfg: &MachineConfig) -> Vec<&Drive> {
     cfg.storage
         .drives
         .iter()
-        .filter(|d| !d.engine.is_snapshot_capable())
+        .filter(|d| !d.medium.is_optical() && !d.engine.is_snapshot_capable())
         .collect()
 }
 

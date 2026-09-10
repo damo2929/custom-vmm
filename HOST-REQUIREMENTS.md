@@ -25,7 +25,7 @@ landed.
 | `KVM_CAP_IOEVENTFD` | virtqueue doorbells without a VM exit (§2.2) | 2.6.x | **hard** |
 | `hugetlbfs`, 1 GiB pages | guest RAM (§1.3) | 2.6.x + CPU `pdpe1gb` | **hard** unless `hugepages_1gb = false` |
 | `fallocate(FALLOC_FL_PUNCH_HOLE)` | SCSI UNMAP (§5.3) | 2.6.38 | for discard |
-| `FICLONE` reflink | `pure_rust_io_uring` snapshots (§10.2) | XFS 4.16 / Btrfs 3.x | for instant backups |
+| `FICLONE` reflink | makes a §10.2 backup *instant* rather than a full copy | XFS 4.16 / Btrfs 3.x | **no** — optimisation only |
 | `io_uring` + `IORING_SETUP_SQPOLL` | the §5.5 datapath | 5.13 | **not yet used** |
 | `usbdevfs` (`/dev/bus/usb`) | USB/IP URB relay (§9.2) | any | for USB export |
 | `AF_XDP` | `rust_af_xdp` net datapath (§11) | 4.18 | **not yet used** |
@@ -77,13 +77,64 @@ default `/dev/hugepages` is usually `pagesize=2M`:
 sudo mount -t hugetlbfs -o pagesize=1G none /dev/hugepages1G
 ```
 
+### UEFI firmware
+
+The machine boots firmware built from `OvmfPkg/CloudHv` (Revision D.9). No
+distribution packages it, so build it once:
+
+```sh
+scripts/build-cloudhv-firmware.sh
+```
+
+**Root is not required.** The script needs `git`, `gcc`, `make` and
+`python3`, plus `nasm` and `iasl` — and where those two are missing it
+downloads their RPMs as an ordinary user and unpacks them into its own work
+directory, the same technique `setup-local-sysroot.sh` uses for the C
+libraries. With root you can install them the usual way instead:
+
+```sh
+sudo dnf install -y nasm acpica-tools
+```
+
+The alternative Q35 path (Revision D.2 option A) runs the distribution's own
+firmware and needs no build at all — `dnf install edk2-ovmf`, then
+`/usr/share/edk2/ovmf/OVMF_CODE.fd`. See [firmware/README.md](firmware/README.md).
+
+### CPU baseline
+
+The tree is built with `-C target-cpu=x86-64-v3` (set in the checked-in
+`.cargo/config.toml`), so the host CPU must implement **x86-64-v3**: AVX2,
+BMI1, BMI2, FMA, MOVBE, F16C and LZCNT on top of the v2 baseline. Every
+server part since Haswell (2013) and Zen 1 (2017) qualifies; check with
+
+```sh
+/lib64/ld-linux-x86-64.so.2 --help | grep x86-64-v3
+```
+
+which prints `(supported, searched)` on a capable host. A binary built here
+raises `SIGILL` on an older CPU rather than running slowly — that is
+deliberate. To build for an older host, override the flag:
+
+```sh
+RUSTFLAGS="-C target-cpu=x86-64-v2" cargo build --release
+```
+
 ### Filesystem
 
-Put drive images on **XFS or Btrfs**. §10.2 declares
-`pure_rust_io_uring` snapshot-capable via reflink; on ext4 the engine falls
-back to a full byte-for-byte copy, which still works but is not instant. The
-fallback is logged, and the manifest records `FullCopy` rather than
-`Reflink`.
+Any filesystem works. A §10.2 backup is a **full byte-for-byte copy** of the
+drive image — that is the proper backup, and it is what the engine produces
+by default and on every filesystem.
+
+Reflink is purely an optimisation on top of that. On **XFS or Btrfs** the
+engine issues `FICLONE`, which produces the same complete, independent
+snapshot in constant time instead of copying every block. Where `FICLONE` is
+unavailable or fails, the engine falls back to the full copy, logs that it
+did so, and records `FullCopy` rather than `Reflink` in the manifest. Both
+methods yield a backup of equal integrity; only the time and the transient
+disk usage differ.
+
+Reflink is therefore never a prerequisite for taking a backup, and no
+configuration may refuse to back up because a filesystem lacks it.
 
 ### Limits
 

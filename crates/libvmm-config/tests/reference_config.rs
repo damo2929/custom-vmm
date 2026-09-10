@@ -32,8 +32,54 @@ fn reference_config_loads() {
     assert_eq!(c.memory.low_ram_mb, 3072);
     assert_eq!(c.memory.high_ram_mb, 5120);
     assert_eq!(c.firmware.code_start_addr, 0xFFC0_0000);
-    assert_eq!(c.storage.drives.len(), 4);
+    assert_eq!(c.storage.drives.len(), 5);
     assert_eq!(c.network.cards.len(), 1);
+}
+
+/// Revision E: every drive the guest sees is either a solid-state disk or an
+/// optical drive, and the reference machine has both.
+#[test]
+fn every_block_drive_is_a_solid_state_disk_that_supports_trim() {
+    use libvmm_config::DriveMedium;
+    let c = reference();
+
+    let block: Vec<_> = c
+        .storage
+        .drives
+        .iter()
+        .filter(|d| !d.medium.is_optical())
+        .collect();
+    assert_eq!(block.len(), 4);
+    for d in &block {
+        assert_eq!(
+            d.medium,
+            DriveMedium::Ssd,
+            "drive {} is not optical, so it is an SSD; there is no other \
+             non-optical medium",
+            d.drive_id
+        );
+        assert_eq!(d.medium.rotation_rate(), Some(libvmm_config::NON_ROTATING));
+        assert!(d.medium.supports_discard(), "an SSD supports TRIM");
+    }
+    // And discard cannot be switched off underneath them.
+    assert!(c.storage.discard_unmap);
+
+    let optical: Vec<_> = c
+        .storage
+        .drives
+        .iter()
+        .filter(|d| d.medium.is_optical())
+        .collect();
+    assert_eq!(optical.len(), 1, "the reference machine has one DVD-ROM");
+    let dvd = optical[0];
+    assert_eq!(dvd.medium, DriveMedium::DvdRom);
+    assert_eq!(dvd.medium.block_size(), 2048);
+    assert!(dvd.medium.is_read_only() && dvd.medium.is_removable());
+    assert_eq!(dvd.medium.mmc_profile(), Some(0x0010));
+    assert!(
+        dvd.file_path.is_some(),
+        "an optical drive is an ISO file; error 1044 refuses one without"
+    );
 }
 
 #[test]

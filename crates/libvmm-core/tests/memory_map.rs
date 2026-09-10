@@ -79,9 +79,16 @@ fn kvm_slots_are_registered_in_spec_order() {
 fn ecam_and_bar_window_sit_inside_the_hole() {
     // The whole PCIe window lives inside the hole, leaving RAM untouched.
     const _: () = assert!(ECAM_BASE >= MMIO_HOLE_START);
-    const _: () = assert!(ECAM_BASE + ECAM_SIZE - 1 == 0xCFFF_FFFF);
-    assert_eq!(PCI_MMIO_BASE, 0xD000_0000);
-    assert_eq!(PCI_MMIO_END, 0xFEBF_FFFF);
+    // Revision D.5: ECAM sits where the reference host's own firmware puts
+    // it and where every edk2 Q35 build hard-codes
+    // `PcdPciExpressBaseAddress`. It is not a free choice.
+    const _: () = assert!(ECAM_BASE == 0xE000_0000);
+    const _: () = assert!(ECAM_BASE + ECAM_SIZE - 1 == 0xEFFF_FFFF);
+    // The BAR window is the hole below ECAM — edk2 computes exactly this
+    // aperture as `PciExBarBase - Uc32Base`.
+    assert_eq!(PCI_MMIO_BASE, 0xC000_0000);
+    assert_eq!(PCI_MMIO_END, 0xDFFF_FFFF);
+    assert_eq!(PCI_MMIO_END + 1, ECAM_BASE, "the BAR window must abut ECAM");
     assert_eq!(IOAPIC_BASE, 0xFEC0_0000);
     assert_eq!(LAPIC_BASE, 0xFEE0_0000);
 }

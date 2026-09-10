@@ -75,6 +75,12 @@ the first case, which is nearly always the real one.
 crash-consistent and logs this as a warning; it is recorded here because it
 appears in logs looking like a failure.
 
+**4013 — a queue worker could not be started.** §5.1 gives every request
+queue its own worker thread, so a controller built one worker short has a
+queue that nothing will ever drain. The guest would not see an error; it
+would see a request that never completes. Refusing to build the device is
+the only answer that fails visibly.
+
 **4002 — the engine could not be opened at `DEVICE_INIT`.** For
 `rust_nvme` this is expected: that engine is a capability contract with no
 datapath, and it fails loudly rather than letting a machine run on a stub.
@@ -108,6 +114,9 @@ Generated from `crates/libvmm-core/src/error.rs` and
 | **1040** | `DuplicateDriveId` | duplicate `drive_id`. |
 | **1041** | `DuplicateSocketPath` | duplicate vhost-user socket path across drives/cards. |
 | **1042** | `BootableDriveCount` | more than one bootable drive, or none. |
+| **1043** | `OpticalEngineNotFileBacked` | a CD/DVD/BD-ROM drive was given an engine other than the file engine: optical media is an ISO on the filesystem, not a block device or an SPDK target. |
+| **1044** | `OpticalMissingImage` | a CD/DVD/BD-ROM drive has no `file_path`. An empty tray is legal at runtime; a drive that never had an image is a configuration mistake. |
+| **1045** | `DiscardRequiredForBlockDrives` | a non-optical drive turned discard off. Every such drive is presented to the guest as an SSD, and an SSD that refuses TRIM is a lie the guest's filesystem will act on. |
 | **1050** | `BitrateAboveCeiling` | VBR target must stay strictly below the hard ceiling (item 10). |
 | **1051** | `BitrateCeilingTooHigh` | the 2000 kbps ceiling is a hard cap, not a suggestion. |
 | **1052** | `AudioFormat` | audio capture format is fixed at 48 kHz S16LE stereo (§7.1). |
@@ -168,6 +177,7 @@ Generated from `crates/libvmm-core/src/error.rs` and
 | **4010** | `UnmapUnsupported` | UNMAP was issued to an engine with no discard support. |
 | **4011** | `UnsupportedCdb` | the guest sent a CDB we do not implement. |
 | **4012** | `SnapshotUnsupported` | the engine cannot take a snapshot (surfaces as 8001 in backup). |
+| **4013** | `QueueWorkerSpawn` | a per-queue worker thread could not be started at DEVICE_INIT. |
 
 ### 5xxx — Media
 

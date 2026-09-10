@@ -39,6 +39,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::devices::DeviceModel;
+use crate::devices::PowerEvent;
 use crate::error::{KvmError, VmmResult};
 
 /// Why a vCPU stopped.
@@ -330,6 +331,19 @@ mod live {
             // is the repeated signal from `shutdown`.
             vcpu.set_kvm_immediate_exit(0);
 
+            // Where the guest was when it took the last exit. A guest that
+            // has stopped making progress still exits — for a timer poll,
+            // say — and the instruction pointer is the difference between
+            // "the firmware's runtime services are stalling" and "the
+            // operating system is spinning". Nothing else tells them apart
+            // from outside. Sampled here rather than beside the exit
+            // because the exit borrows the vCPU.
+            if log::log_enabled!(log::Level::Trace) {
+                if let Ok(regs) = vcpu.get_regs() {
+                    log::trace!("vcpu-{index}: rip {:#018x}", regs.rip);
+                }
+            }
+
             match vcpu.run() {
                 Ok(exit) => match service(index, exit, state) {
                     Some(outcome) => break outcome,
@@ -366,20 +380,31 @@ mod live {
             VcpuExit::IoIn(port, data) => {
                 counters.io_in.fetch_add(1, Ordering::Relaxed);
                 with_devices(state, |d| d.io_read(port, data));
+                log::trace!("vcpu-{index}: in  {port:#06x} -> {data:02x?}");
                 None
             }
             VcpuExit::IoOut(port, data) => {
                 counters.io_out.fetch_add(1, Ordering::Relaxed);
+                log::trace!("vcpu-{index}: out {port:#06x} <- {data:02x?}");
                 with_devices(state, |d| d.io_write(port, data));
-                None
+                // An ACPI shutdown is an ordinary `out dx, ax` to the PM
+                // block; KVM never sees it as a system event, so the only
+                // place it can be noticed is here, after the write landed.
+                match take_power_event(state) {
+                    Some(PowerEvent::Off) => Some(Outcome::PowerOff),
+                    Some(PowerEvent::Reset) => Some(Outcome::Reset),
+                    None => None,
+                }
             }
             VcpuExit::MmioRead(addr, data) => {
                 counters.mmio_read.fetch_add(1, Ordering::Relaxed);
                 with_devices(state, |d| d.mmio_read(addr, data));
+                log::trace!("vcpu-{index}: mmio r {addr:#x} -> {data:02x?}");
                 None
             }
             VcpuExit::MmioWrite(addr, data) => {
                 counters.mmio_write.fetch_add(1, Ordering::Relaxed);
+                log::trace!("vcpu-{index}: mmio w {addr:#x} <- {data:02x?}");
                 with_devices(state, |d| d.mmio_write(addr, data));
                 None
             }
@@ -425,6 +450,15 @@ mod live {
                 None
             }
         }
+    }
+
+    /// Collect a pending power request from the device model.
+    fn take_power_event(state: &Arc<RunState>) -> Option<PowerEvent> {
+        state
+            .devices
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take_power_event()
     }
 
     /// Take the device lock, tolerating poison.

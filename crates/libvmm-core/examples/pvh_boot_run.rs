@@ -89,7 +89,8 @@ fn main() {
         0,
     ));
     let log = SerialLog::new();
-    let devices = DeviceModel::new(bus, 1024 * memory::MIB, 0, std::sync::Arc::clone(&log));
+    let mut devices = DeviceModel::new(bus, 1024 * memory::MIB, 0, std::sync::Arc::clone(&log));
+    devices.set_wall_clock(machine.wall_clock());
     let running = libvmm_core::vcpu::spawn(
         machine.take_vcpus(),
         libvmm_core::vcpu::RunState::new(devices),

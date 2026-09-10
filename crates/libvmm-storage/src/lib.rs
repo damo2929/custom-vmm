@@ -15,7 +15,9 @@
 pub mod backup;
 pub mod engine;
 pub mod engines;
+pub mod mmc;
 pub mod scsi;
+pub mod scsi_pci;
 pub mod vhost_user;
 
 pub use engine::{

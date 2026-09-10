@@ -15,13 +15,42 @@ pub const MMIO_HOLE_START: u64 = 0xC000_0000;
 pub const MMIO_HOLE_END: u64 = 0xFFFF_FFFF;
 pub const MMIO_HOLE_SIZE: u64 = MMIO_HOLE_END - MMIO_HOLE_START + 1;
 
-/// ECAM / PCIe MMCONFIG base (§2.1), 256 MiB covering buses 0..=255.
-pub const ECAM_BASE: u64 = 0xC000_0000;
+/// ECAM / PCIe MMCONFIG base (§2.1 as revised by Revision D.5), 256 MiB
+/// covering buses 0..=255.
+///
+/// §2.1 originally put this at the bottom of the MMIO hole, 0xC000_0000.
+/// It moved for two reasons that turned out to be the same reason.
+///
+/// The first is firmware. edk2 fixes `PcdPciExpressBaseAddress` at
+/// 0xE000_0000 for every Q35 build, `PlatformInitLib` *programs* that value
+/// into the host bridge's `PCIEXBAR` rather than reading ours, and once DXE
+/// swaps `BasePciLibCf8` for `DxePciLibI440FxQ35` every configuration access
+/// goes there. With ECAM at 0xC000_0000 those reads fell through to nothing,
+/// returned zero, and OVMF computed an ACPI timer at port 0x0008 — where it
+/// then spun, four and a half million reads in twenty seconds, waiting for a
+/// counter that would never advance.
+///
+/// The second is the host. The reference machine's own firmware reports
+/// `PCI: ECAM [mem 0xe0000000-0xefffffff] (base 0xe0000000) for domain 0000
+/// [bus 00-ff]` — the same base, the same 256 MiB, the same bus range.
+/// Mirroring the live system and satisfying the firmware are the same
+/// address.
+///
+/// The rest of the hole then falls out of edk2's own Q35 map: the 32-bit BAR
+/// window runs from the top of low RAM up to ECAM, so it becomes
+/// 0xC000_0000..0xDFFF_FFFF — the space ECAM vacated, and half a gigabyte
+/// rather than the 236 MiB it had before.
+pub const ECAM_BASE: u64 = 0xE000_0000;
 pub const ECAM_SIZE: u64 = 256 * MIB;
 
-/// PCIe BAR MMIO window, between ECAM and the I/O APIC.
-pub const PCI_MMIO_BASE: u64 = 0xD000_0000;
-pub const PCI_MMIO_END: u64 = 0xFEBF_FFFF;
+/// PCIe BAR MMIO window: the bottom of the hole, up to ECAM.
+///
+/// This is the aperture edk2 derives as `PciExBarBase - Uc32Base`, and with
+/// low RAM filling the hole it is exactly this range. Above ECAM,
+/// 0xF000_0000..0xFEBF_FFFF, edk2's map has a gap and so does this one; the
+/// I/O APIC and LAPIC sit above that.
+pub const PCI_MMIO_BASE: u64 = 0xC000_0000;
+pub const PCI_MMIO_END: u64 = 0xDFFF_FFFF;
 pub const PCI_MMIO_SIZE: u64 = PCI_MMIO_END - PCI_MMIO_BASE + 1;
 
 /// I/O APIC — userspace, because the irqchip is split (§1.4).
@@ -51,6 +80,11 @@ pub const ACPI_STAGING_SIZE: u64 = 0x0001_0000;
 pub const SLOT_LOW_RAM: u32 = 0;
 pub const SLOT_HIGH_RAM: u32 = 1;
 pub const SLOT_OVMF_CODE: u32 = 2;
+/// The display's framebuffer BAR, registered as guest RAM so the guest can
+/// paint into it at memory speed instead of taking an exit per pixel. It is
+/// not part of the boot-time map: the slot is (re)registered wherever
+/// firmware puts the BAR. See [`crate::display`].
+pub const SLOT_FRAMEBUFFER: u32 = 3;
 
 /// What a region is for; drives the KVM flags and who services faults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

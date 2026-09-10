@@ -90,6 +90,32 @@ pub enum ConfigError {
     #[error("storage.drives: expected exactly one bootable drive, found {count}")]
     BootableDriveCount { count: usize },
 
+    /// 1043 — an optical drive was bound to an engine that cannot present a
+    /// read-only ISO image.
+    #[error(
+        "storage.drives[{drive_id}]: medium {medium} is an ISO image and needs a file-backed \
+         engine; {engine} addresses a device, not a file"
+    )]
+    OpticalEngineNotFileBacked {
+        drive_id: u32,
+        medium: &'static str,
+        engine: &'static str,
+    },
+
+    /// 1044 — an optical drive has no ISO to present.
+    #[error(
+        "storage.drives[{drive_id}]: medium {medium} needs file_path pointing at an ISO image"
+    )]
+    OpticalMissingImage { drive_id: u32, medium: &'static str },
+
+    /// 1045 — discard was turned off on a machine that has block drives.
+    #[error(
+        "storage.discard_unmap = false, but {count} drive(s) are presented to the guest as \
+         solid-state disks, which advertise UNMAP. A drive cannot claim to be an SSD and \
+         refuse TRIM."
+    )]
+    DiscardRequiredForBlockDrives { count: usize },
+
     // -- display / encoder --------------------------------------------------
     /// 1050 — VBR target must stay strictly below the hard ceiling (item 10).
     #[error("display.encoder.bitrate_kbps ({target}) must be < max_bitrate_kbps ({ceiling})")]
@@ -187,6 +213,9 @@ impl ConfigError {
             ConfigError::DuplicateDriveId { .. } => 1040,
             ConfigError::DuplicateSocketPath { .. } => 1041,
             ConfigError::BootableDriveCount { .. } => 1042,
+            ConfigError::OpticalEngineNotFileBacked { .. } => 1043,
+            ConfigError::OpticalMissingImage { .. } => 1044,
+            ConfigError::DiscardRequiredForBlockDrives { .. } => 1045,
             ConfigError::BitrateAboveCeiling { .. } => 1050,
             ConfigError::BitrateCeilingTooHigh { .. } => 1051,
             ConfigError::AudioFormat { .. } => 1052,

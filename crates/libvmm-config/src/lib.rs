@@ -425,6 +425,131 @@ pub enum DriveTransport {
     VirtioScsi,
 }
 
+/// What kind of drive the guest sees (§5.3, Revision E).
+///
+/// This is the *presentation*, not the backing store: every medium here is a
+/// file behind one of the four §5.4 engines. What it changes is what SCSI
+/// says about itself — the peripheral device type, whether the medium is
+/// removable, the logical block size, and the rotation rate — and that is
+/// what decides whether a guest treats a drive as an SSD, a spinning disk,
+/// or something it can boot an installer from.
+///
+/// virtio-scsi carries all of them on one HBA, which is the reason §5 chose
+/// it: SCSI has always addressed mixed device types on one bus, so an
+/// optical drive and an SSD need no second controller between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DriveMedium {
+    /// Solid-state disk. Direct-access, writable, fixed, 512-byte blocks,
+    /// and **rotation rate 1** in VPD page 0xB1 — which is the entire
+    /// mechanism by which a guest knows it is not a spinning disk. Linux
+    /// publishes it as `/sys/block/sdX/queue/rotational = 0` and its I/O
+    /// schedulers, readahead and discard behaviour all key off that.
+    ///
+    /// This is the only non-optical medium there is, deliberately. Every
+    /// drive that is not an optical drive is presented as a solid-state
+    /// disk that supports TRIM, because every drive here *is* one: the
+    /// backing store is a file or a namespace that punches holes, with no
+    /// seek latency to model and no reason to ask a guest to schedule for
+    /// one. There is no rotating-disk variant to select.
+    #[default]
+    Ssd,
+    /// CD-ROM. MMC peripheral type, removable, read-only, 2048-byte blocks.
+    #[serde(rename = "cdrom")]
+    CdRom,
+    /// DVD-ROM. Identical to [`DriveMedium::CdRom`] except for the profile
+    /// reported by GET CONFIGURATION and the capacities that implies.
+    #[serde(rename = "dvdrom")]
+    DvdRom,
+    /// BD-ROM (Blu-ray).
+    #[serde(rename = "bdrom")]
+    BdRom,
+}
+
+/// VPD page 0xB1's value for a solid-state medium (SBC-4 §B.2 table B.2).
+pub const NON_ROTATING: u16 = 1;
+
+impl DriveMedium {
+    /// SCSI peripheral device type, INQUIRY byte 0 bits 4:0 (SPC-4 §6.4.2).
+    ///
+    /// `0x00` is direct-access; `0x05` is CD/DVD, which selects the MMC
+    /// command set. A guest reads this byte before anything else and it
+    /// decides which driver binds: on Linux, `sd` or `sr`.
+    pub const fn peripheral_device_type(self) -> u8 {
+        match self {
+            DriveMedium::Ssd => 0x00,
+            DriveMedium::CdRom | DriveMedium::DvdRom | DriveMedium::BdRom => 0x05,
+        }
+    }
+
+    /// Is this the MMC command set rather than the block command set?
+    pub const fn is_optical(self) -> bool {
+        self.peripheral_device_type() == 0x05
+    }
+
+    /// INQUIRY byte 1 bit 7, RMB. Optical media can be ejected.
+    pub const fn is_removable(self) -> bool {
+        self.is_optical()
+    }
+
+    /// Optical media here are ROM: a write must be refused by the drive, not
+    /// by the file permissions, so the guest gets a sense key it understands
+    /// rather than an I/O error it does not.
+    pub const fn is_read_only(self) -> bool {
+        self.is_optical()
+    }
+
+    /// Logical block size. 2048 for every optical profile — that is not a
+    /// choice, it is the sector size of the media.
+    pub const fn block_size(self) -> u32 {
+        if self.is_optical() {
+            2048
+        } else {
+            512
+        }
+    }
+
+    /// VPD page 0xB1 MEDIUM ROTATION RATE (SBC-4 §B.2).
+    ///
+    /// `1` means "non-rotating", and it is the only value this machine ever
+    /// reports for a block device. `None` means the page is not offered at
+    /// all, which is correct for optical media: the field describes a block
+    /// device's platters, and an MMC drive's spindle speed is not that.
+    pub const fn rotation_rate(self) -> Option<u16> {
+        match self {
+            DriveMedium::Ssd => Some(NON_ROTATING),
+            _ => None,
+        }
+    }
+
+    /// Does this medium support TRIM / SCSI UNMAP?
+    ///
+    /// Every block device here does, unconditionally. Optical media are ROM
+    /// and have nothing to discard.
+    pub const fn supports_discard(self) -> bool {
+        !self.is_optical()
+    }
+
+    /// The MMC feature profile reported by GET CONFIGURATION (MMC-6 §5.3.1).
+    pub const fn mmc_profile(self) -> Option<u16> {
+        match self {
+            DriveMedium::CdRom => Some(0x0008),
+            DriveMedium::DvdRom => Some(0x0010),
+            DriveMedium::BdRom => Some(0x0040),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            DriveMedium::Ssd => "ssd",
+            DriveMedium::CdRom => "cdrom",
+            DriveMedium::DvdRom => "dvdrom",
+            DriveMedium::BdRom => "bdrom",
+        }
+    }
+}
+
 /// `[[storage.drives]]` — one guest disk bound to a unified engine.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -434,6 +559,12 @@ pub struct Drive {
     pub bootable: bool,
     #[serde(rename = "type")]
     pub transport: DriveTransport,
+    /// What the guest sees. Defaults to [`DriveMedium::Ssd`], so an existing
+    /// configuration that names no medium keeps describing a solid-state
+    /// disk — which is what every drive in this tree was before the field
+    /// existed.
+    #[serde(default)]
+    pub medium: DriveMedium,
     pub engine: EngineKind,
     /// vhost-user front-end socket for this drive's back-end (§5.6).
     pub socket_path: PathBuf,

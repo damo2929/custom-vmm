@@ -228,6 +228,98 @@ fn fadt_carries_a_reset_register() {
     assert_eq!(fadt[128], acpi::builder::RESET_VALUE);
 }
 
+/// Revision D.10: the FADT must describe the machine that exists, not a
+/// PC-compatible one. Every field checked here is a register something in
+/// `crate::cloudhv` actually decodes, and the flags say which half of the
+/// table to believe.
+#[test]
+fn the_fadt_describes_the_hardware_reduced_platform_it_runs_on() {
+    use libvmm_core::cloudhv;
+
+    let cfg = reference();
+    let set = build_with(
+        &cfg,
+        vec![
+            ("msdm.bin", synthetic_table(b"MSDM", 8)),
+            ("slic.bin", synthetic_table(b"SLIC", 8)),
+        ],
+    )
+    .unwrap();
+    let fadt = &set.find("FACP").unwrap().bytes;
+    assert_eq!(fadt.len(), 276, "a revision 6 FADT");
+
+    let flags = u32::from_le_bytes(fadt[112..116].try_into().unwrap());
+    assert_ne!(flags & (1 << 20), 0, "HW_REDUCED_ACPI");
+    assert_ne!(flags & (1 << 10), 0, "RESET_REG_SUP");
+    assert_ne!(
+        flags & (1 << 8),
+        0,
+        "TMR_VAL_EXT — and CloudHvPm's timer is the 32-bit one"
+    );
+
+    // With HW_REDUCED_ACPI set there is no FACS, and pointing at one is an
+    // error rather than a courtesy.
+    assert_eq!(u32::from_le_bytes(fadt[36..40].try_into().unwrap()), 0);
+    assert_eq!(u64::from_le_bytes(fadt[132..140].try_into().unwrap()), 0);
+
+    // A GAS is space(1) width(1) offset(1) size(1) address(8).
+    let gas = |at: usize| -> (u8, u8, u64) {
+        (
+            fadt[at],
+            fadt[at + 1],
+            u64::from_le_bytes(fadt[at + 4..at + 12].try_into().unwrap()),
+        )
+    };
+    const SYSTEM_IO: u8 = 1;
+
+    assert_eq!(
+        gas(244),
+        (SYSTEM_IO, 8, u64::from(cloudhv::ACPI_SHUTDOWN_IO_ADDRESS)),
+        "SLEEP_CONTROL_REG"
+    );
+    assert_eq!(
+        gas(256),
+        (
+            SYSTEM_IO,
+            8,
+            u64::from(cloudhv::ACPI_SLEEP_STATUS_IO_ADDRESS)
+        ),
+        "SLEEP_STATUS_REG"
+    );
+    assert_eq!(
+        gas(208),
+        (SYSTEM_IO, 32, u64::from(cloudhv::ACPI_TIMER_IO_ADDRESS)),
+        "X_PM_TMR_BLK"
+    );
+
+    // The PM1 blocks a hardware-reduced platform is not supposed to have.
+    // Windows' hvloader refuses a HW-reduced FADT whose PM1a GAS is zero,
+    // so they are declared, and `CloudHvPm` decodes them.
+    assert_eq!(
+        gas(148),
+        (SYSTEM_IO, 32, u64::from(cloudhv::PM1A_EVT_IO_ADDRESS)),
+        "X_PM1a_EVT_BLK"
+    );
+    assert_eq!(
+        gas(172),
+        (SYSTEM_IO, 16, u64::from(cloudhv::PM1A_CNT_IO_ADDRESS)),
+        "X_PM1a_CNT_BLK"
+    );
+    for port in [
+        cloudhv::PM1A_EVT_IO_ADDRESS,
+        cloudhv::PM1A_CNT_IO_ADDRESS,
+        cloudhv::ACPI_TIMER_IO_ADDRESS,
+        cloudhv::ACPI_SHUTDOWN_IO_ADDRESS,
+        cloudhv::ACPI_SLEEP_STATUS_IO_ADDRESS,
+        cloudhv::RESET_IO_ADDRESS,
+    ] {
+        assert!(
+            cloudhv::CloudHvPm::claims(port),
+            "the FADT names {port:#06x}, so something must answer it"
+        );
+    }
+}
+
 #[test]
 fn tpm2_table_is_omitted_when_the_tpm_is_disabled() {
     let mut cfg = reference();

@@ -22,11 +22,20 @@ is itself a specified thing. Three further crates exist only to hold what
 §1.1 did not anticipate: `vmm-codec-sys` and `vmm-rbd-sys` contain the entire
 C surface, and `vmm-sysdeps` is build-script support that locates it.
 
-The spec has been revised once by implementation experience:
-[Revision B](docs/spec-revision-B-media-codecs.md) replaced the fixed media
-codecs with negotiated ones. That is the model to follow when the spec turns
-out to be wrong: write the revision down, with the reasoning, rather than
-letting the code and the document drift apart.
+The spec has been revised three times by implementation experience:
+
+| revision | what it changed |
+|---|---|
+| [B](docs/spec-revision-B-media-codecs.md) | fixed media codecs became negotiated ones |
+| [C](docs/spec-revision-C-rtsp-session-state.md) | RTSP session state |
+| [D](docs/spec-revision-D-boot-and-platform.md) | boot path and platform identity |
+
+That is the model to follow when the spec turns out to be wrong: **write the
+revision down, with the reasoning, rather than letting the code and the
+document drift apart.** A revision may also be left *open* — Revision D.2
+states the host-bridge question and the case either way without deciding it,
+because that decision is the operator's, not the implementer's. An open
+question written down is worth more than a silent default in the code.
 
 ---
 
@@ -34,12 +43,26 @@ letting the code and the document drift apart.
 
 ```sh
 cargo build --workspace
-cargo test  --workspace            # 367 tests, all must pass
+cargo test  --workspace            # all must pass
 cargo clippy --workspace --all-targets   # must be warning-free
 cargo fmt --all
 ```
 
 `cargo` is at `~/.cargo/bin`; add it to `PATH` if the shell has not.
+
+### The ISA baseline
+
+`.cargo/config.toml` is **checked in** and sets `-C target-cpu=x86-64-v3`.
+The hot paths here are byte movers — virtqueue descriptor walks, framebuffer
+format conversion, AV1 packetisation — and at the default baseline LLVM must
+assume SSE2 only. The consequence is that a binary built here raises `SIGILL`
+on a pre-2013 CPU rather than running slowly, which is the intended trade for
+host software; see [HOST-REQUIREMENTS.md](HOST-REQUIREMENTS.md).
+
+Only the trailing `[env]` stanza of that file is machine-local, and
+`scripts/setup-local-sysroot.sh` rewrites *just that stanza*. If you change
+the script, keep it patching rather than overwriting — an overwrite silently
+drops the ISA baseline from every subsequent build.
 
 ### The C libraries
 
@@ -77,6 +100,72 @@ cases where it does not.
 
 These are not style preferences. Each one exists because violating it
 produced a real bug in this tree.
+
+### Work from the specification, not the symptom
+
+When something does not work, find the document that says what it should do
+and read it — the Xen PVH ABI, the virtio 1.x spec, the ACPI tables, the edk2
+source — before changing a line. Every one of the bugs listed below was found
+this way and none of them would have been found by poking at the symptom:
+
+* The FADT never pointed at the DSDT. A comment claimed it was "patched at
+  link time"; no link step existed. Every checksum passed, so nothing looked
+  wrong until a guest oopsed inside `acpi_tb_load_namespace`. The FADT layout
+  in ACPI 6.x — `DSDT` at offset 40, `X_DSDT` at 140 — is what identified it.
+* A vCPU thread died on a feature-word read because Linux asks for selector
+  2 and `offered >> 64` overflows. The guest then hung forever with no
+  message. virtio 1.x §4.1.4.3 says what selector 2 means; the fix follows
+  from the spec, not from the hang.
+* Packed virtqueues ignored `VIRTQ_DESC_F_INDIRECT`, so the descriptor table
+  itself arrived as the request. §2.8.7 — packed indirect tables are consumed
+  *in order*, with no `next` chaining — is the whole fix.
+
+The corollary: a fix you cannot trace to a sentence in a document is a guess.
+Say so if you ship one.
+
+### The platform is PCIe-native
+
+**Never present i440FX.** There is no PIIX, no ISA bus behind a legacy
+bridge, no INTx: configuration is ECAM, interrupts are MSI-X, and
+`INTERRUPT_PIN` is 0 on every function.
+
+Revision D.9 settled how far that goes: the machine is a **PCIe root complex
+and nothing else** — one host bridge at 00:00.0 with the CloudHv identity
+`8086:0d57`, hardware-reduced ACPI at two fixed I/O addresses, and no LPC
+bridge, no PMBASE, no `fw_cfg`, no A20 gate, no PIC and no PIT. A complete
+UEFI boot leaves two unanswered I/O accesses.
+
+The Q35 path and its ICH9 LPC stub (`crate::ich9`, Revision D.6) still exist
+and still work, because they are what runs the *distribution's* unmodified
+OVMF. Keep them working, but do not build new platform behaviour on them:
+they are the compatibility path, not the machine.
+
+The two are mutually exclusive at runtime and the exclusion is a hard
+assertion, not a convention. `0x0600` is `PM1_STS` on one and
+`SLEEP_CONTROL_REG` on the other — same address, same write, opposite
+meaning — so presenting both would show up as a firmware that shuts the guest
+down while clearing a status bit.
+
+### A guest with no driver still needs a screen
+
+The machine has two display devices and that is deliberate (Revision D.10).
+virtio-gpu is the better one; edk2's `VirtioGpuDxe` reports `PixelBltOnly`
+and no `FrameBufferBase`, so once a guest calls `ExitBootServices` the
+firmware driver that used to forward `Blt` is gone and the guest has nowhere
+to paint. Windows has no inbox virtio-gpu driver. So there is also a Bochs
+VBE linear framebuffer (`crate::display`), which every guest can write to
+with no driver at all.
+
+Its BAR 0 is a **KVM memory slot, not an MMIO region**, and the two rules
+that follow are not optional: the slot is published only while the command
+register's memory-space bit is set, and it moves when firmware moves the
+BAR. A framebuffer that trapped would cost one vCPU exit per pixel.
+
+When you are chasing "the guest is running but the screen is frozen", check
+which surface is being painted before anything else. Both are readable from
+the host without the guest's cooperation — `Framebuffer::snapshot` and
+`gpu::frame_from_backing` — and the answer is usually one of them holding a
+stale frame.
 
 ### Ask the system, do not assume
 
@@ -136,6 +225,27 @@ something that failed later at `cargo build`. It now links a real program.
 The same rule drives the tests: `libvmm-media` pushes a real BGRA frame
 through convert → encode → RTP → depacketise → decode and compares the
 picture that comes out against the one that went in.
+
+For the boot path there is an equivalent, and it is the only one that
+settles an argument about whether a guest is really running. Set
+`VMM_DUMP_SCANOUT=<path>` and the raw pre-encode BGRX scanout is written out
+as a PPM; OCR it against the guest kernel's *own* `font_8x16.c` glyph table
+and you get the console text back, character-exact. That distinguishes "the
+guest drew nothing" from "the encoder or the client lost it" — two failures
+that look identical from a black window, and which cost a day when guessed
+at. A frame counter is a proxy; the decoded text is the thing.
+
+### A device model may not hang the guest
+
+A panic inside a device used to take the vCPU thread with it. The guest then
+blocked forever on an MMIO access nobody would ever answer: a silent,
+undebuggable stop, with the real error printed on a thread nobody was
+watching. It reads as the guest's fault, which is the worst possible outcome.
+
+Device access is therefore wrapped in `catch_unwind`, and a panic stops the
+machine with the reason attached. Keep it that way. The same reasoning
+applies to any read a guest controls: answer it, or fail loudly — never
+neither.
 
 ### Isolate `unsafe`
 
@@ -218,6 +328,9 @@ change:
 | an error variant | [docs/error-codes.md](docs/error-codes.md) |
 | media behaviour the spec fixes | a new revision under `docs/`, in spec voice |
 | a linked C library | `deny.toml` and `scripts/c-dependency-inventory.sh` |
+| the boot path or the platform we present | a new revision under `docs/`, in spec voice |
+| how the firmware is built | `scripts/build-cloudhv-firmware.sh` and `firmware/README.md` |
+| what a guest can be booted to, and how | [CHECKPOINT.md](CHECKPOINT.md), with the exact commands |
 
 `IMPLEMENTATION-STATUS.md` is an **honest ledger**. Mark work `partial` with
 the reason, not `done`, when part of it is missing. Its value is that a
@@ -237,3 +350,8 @@ cases where it compiled, reported success, and was wrong: a sysroot that
 passed `pkg-config` and could not link, a preflight check that was a coin
 flip, a negotiation whose compatibility guarantee had no implementation
 behind it. **Run it.**
+
+For anything on the boot path, "run it" means *boot a guest*. Three of the
+bugs above passed the whole unit suite; all three were found in the first
+minute of running a real kernel. Quote what the guest printed, not what the
+test asserted.

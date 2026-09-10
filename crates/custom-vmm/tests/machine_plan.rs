@@ -138,12 +138,21 @@ fn the_thread_taxonomy_matches_spec_1_2() {
     assert!(threads.contains(&"main/control".to_string()));
     for i in 0..n {
         assert!(threads.contains(&format!("vcpu-{i}")), "vcpu-{i} missing");
-        // §5.1: request queue k is served by scsi-q-k, pinned with vcpu-k.
-        assert!(
-            threads.contains(&format!("scsi-q-{i}")),
-            "scsi-q-{i} missing"
-        );
+        // §5.1 / Revision E: every drive has its own controller, and every
+        // controller has one request queue per vCPU with one worker each.
+        // A shared HBA would give one set of workers for all drives, so an
+        // optical drive being polled could delay the disk an installer is
+        // writing to.
+        for d in &cfg.storage.drives {
+            let name = format!("scsi{}-q{i}", d.drive_id);
+            assert!(threads.contains(&name), "{name} missing");
+        }
     }
+    assert_eq!(
+        threads.iter().filter(|t| t.starts_with("scsi")).count(),
+        cfg.storage.drives.len() * n as usize,
+        "one worker per queue per drive, and no more"
+    );
     assert!(threads.contains(&"media-capture".to_string()));
     assert!(threads.contains(&"media-encode".to_string()));
     assert!(threads.contains(&"wss-listener".to_string()));

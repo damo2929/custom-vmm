@@ -371,7 +371,16 @@ fn preflight_passes_when_every_drive_can_snapshot() {
         .drives
         .retain(|d| d.engine.is_snapshot_capable());
     let drives = backup::preflight(&cfg).expect("all-snapshot machine must pass preflight");
+    // Two writable drives. The reference machine's DVD-ROM also sits on a
+    // snapshot-capable engine and so survives the filter above, but a
+    // backup excludes optical media: the ISO is read-only external media,
+    // not machine state, and a Windows installer image is several
+    // gigabytes of it in every backup.
     assert_eq!(drives.len(), 2);
+    assert!(
+        drives.iter().all(|d| !d.medium.is_optical()),
+        "a backup must not include an optical drive"
+    );
 }
 
 #[test]

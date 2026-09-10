@@ -312,3 +312,49 @@ fn a_guest_that_triple_faults_is_reported_as_such() {
         "a triple fault must be reported, not swallowed"
     );
 }
+
+/// §11 `kvm_ptp_clock`: the RTC and the guest's paravirtual clock must be two
+/// readings of one clock, not two clocks that happen to agree.
+///
+/// `KVM_GET_CLOCK` with `KVM_CLOCK_REALTIME` and the `KVM_HC_CLOCK_PAIRING`
+/// hypercall that `ptp_kvm` issues both resolve to `ktime_get_snapshot()` in
+/// the kernel, so this checks the VMM is asking through that interface at
+/// all — a `get_clock` that fails or returns no realtime field falls back to
+/// `gettimeofday`, which would pass a "roughly the right time" assertion
+/// while defeating the point.
+#[test]
+fn the_rtc_reads_the_same_clock_the_guest_gets_from_kvm() {
+    if !kvm_available() {
+        eprintln!("skipping: no usable /dev/kvm");
+        return;
+    }
+
+    use libvmm_core::devices::WallClock;
+
+    let cfg = config(1);
+    let map = GuestMemoryMap::new(&cfg.memory).expect("memory map");
+    let machine = libvmm_core::kvm::Machine::bringup(&cfg, map).expect("KVM bring-up");
+
+    let kvm_clock = machine.wall_clock();
+    let from_kvm = kvm_clock.realtime_nanos();
+    let from_host = libvmm_core::devices::SystemWallClock.realtime_nanos();
+
+    // Both are nanoseconds since the Unix epoch, so they must agree to far
+    // better than the RTC's one-second resolution. A millisecond is loose
+    // enough to survive a scheduling delay between the two reads and tight
+    // enough to catch a wrong epoch or a wrong unit.
+    let skew = from_kvm.abs_diff(from_host);
+    assert!(
+        skew < 1_000_000,
+        "the KVM clock and the host clock differ by {skew} ns; they are \
+         supposed to be the same clock"
+    );
+
+    // And it must advance, because an RTC that returns a constant looks
+    // correct for exactly one reading.
+    std::thread::sleep(Duration::from_millis(20));
+    assert!(
+        kvm_clock.realtime_nanos() > from_kvm,
+        "the clock must advance"
+    );
+}

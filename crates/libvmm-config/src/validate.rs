@@ -370,11 +370,60 @@ fn validate_storage(s: &Storage) -> ConfigResult<()> {
         if d.bootable {
             bootable += 1;
         }
+        validate_optical(d)?;
         validate_engine_binding(&format!("storage.drives[{}]", d.drive_id), &d.binding())?;
     }
 
     if !s.drives.is_empty() && bootable != 1 {
         return Err(ConfigError::BootableDriveCount { count: bootable });
+    }
+
+    // Every block drive is presented as an SSD, and an SSD supports TRIM.
+    // `discard_unmap` chooses the *mechanism* — change-log item 8 fixed it
+    // at SCSI UNMAP — not whether discard exists at all, so turning it off
+    // would produce a drive that reports rotation rate 1 and then refuses
+    // the command that goes with it. A guest would find that out only when
+    // `fstrim` failed.
+    let block_drives = s.drives.iter().filter(|d| !d.medium.is_optical()).count();
+    if !s.discard_unmap && block_drives > 0 {
+        return Err(ConfigError::DiscardRequiredForBlockDrives {
+            count: block_drives,
+        });
+    }
+    Ok(())
+}
+
+/// An optical drive is an ISO file and nothing else (§5.3, Revision E).
+///
+/// Both checks here exist because the failure they prevent is silent. An
+/// optical drive bound to `rust_nvme` would address a host namespace, which
+/// has no ISO in it, and the guest would find a CD-ROM full of whatever was
+/// on that namespace. An optical drive with no `file_path` would come up as
+/// a drive with no medium — legal SCSI, and indistinguishable from an empty
+/// tray, so the guest would report "no disc" and nobody would learn that the
+/// configuration was wrong.
+fn validate_optical(d: &Drive) -> ConfigResult<()> {
+    if !d.medium.is_optical() {
+        return Ok(());
+    }
+    // `rust_hugepage_file` is volatile but it *is* a file, and a scratch ISO
+    // is a coherent thing to want. `rust_nvme` and `rust_ceph_rbd` address a
+    // device and an RBD image; neither is an ISO on this host.
+    if !matches!(
+        d.engine,
+        EngineKind::PureRustIoUring | EngineKind::RustHugepageFile
+    ) {
+        return Err(ConfigError::OpticalEngineNotFileBacked {
+            drive_id: d.drive_id,
+            medium: d.medium.as_str(),
+            engine: d.engine.as_str(),
+        });
+    }
+    if d.file_path.is_none() {
+        return Err(ConfigError::OpticalMissingImage {
+            drive_id: d.drive_id,
+            medium: d.medium.as_str(),
+        });
     }
     Ok(())
 }

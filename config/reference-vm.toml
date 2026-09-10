@@ -99,10 +99,15 @@ sqpoll_thread = true
 discard_unmap = true # SCSI UNMAP (0x42)
 max_discard_sectors = 2097152
 
+# Every non-optical drive is presented to the guest as a solid-state disk
+# that supports TRIM: peripheral device type 0, rotation rate 1 in VPD page
+# 0xB1, and SCSI UNMAP. `medium` may be omitted, because "ssd" is the default
+# and the only non-optical value there is.
 [[storage.drives]]
 drive_id = 0
 bootable = true
 type = "virtio_scsi"
+medium = "ssd"
 engine = "pure_rust_io_uring" # snapshot-capable (reflink on CoW FS)
 file_path = "/var/lib/vmm/disks/boot_os.raw"
 socket_path = "/var/run/vmm-vhost-scsi0.sock"
@@ -135,6 +140,25 @@ engine = "rust_hugepage_file" # volatile scratch - NOT snapshot-capable
 file_path = "/dev/hugepages/fast_scratch.mem"
 shared_mem_size_mb = 1024
 socket_path = "/var/run/vmm-vhost-scsi3.sock"
+
+# An optical drive. `medium` is "cdrom", "dvdrom" or "bdrom"; all three read
+# an ISO file in 2048-byte sectors and differ only in the profile reported by
+# GET CONFIGURATION, which is what a guest reads to decide what kind of disc
+# it is holding. The drive is read-only: a write is refused with sense key
+# DATA PROTECT rather than passed to the engine.
+#
+# The engine must be file-backed (`pure_rust_io_uring` or
+# `rust_hugepage_file`); binding an optical drive to `rust_nvme` or
+# `rust_ceph_rbd` addresses a device rather than an ISO and is refused with
+# error 1043.
+[[storage.drives]]
+drive_id = 4
+bootable = false
+type = "virtio_scsi"
+medium = "dvdrom"
+engine = "pure_rust_io_uring"
+file_path = "/var/lib/vmm/iso/install.iso"
+socket_path = "/var/run/vmm-vhost-scsi4.sock"
 
 [network]
 bus = 6

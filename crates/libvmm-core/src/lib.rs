@@ -9,8 +9,11 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod acpi;
+pub mod cloudhv;
 pub mod devices;
+pub mod display;
 pub mod error;
+pub mod ich9;
 pub mod kvm;
 pub mod lifecycle;
 pub mod memory;

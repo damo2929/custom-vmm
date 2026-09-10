@@ -56,6 +56,24 @@ impl GuestRam {
         })
     }
 
+    /// A host pointer to `gpa..gpa + len`, or `None` if that range is not
+    /// wholly inside one region.
+    ///
+    /// This is what lets a storage engine `pread` **straight into guest
+    /// memory** with no bounce buffer: the descriptor the guest supplied is
+    /// handed to the kernel as the destination. The bounds check is the
+    /// same one every other access here performs, and it is the reason the
+    /// resulting pointer can be trusted.
+    ///
+    /// The pointer is only valid while the VM's memory mappings are — that
+    /// is, for the life of the `Machine` — which is the same lifetime the
+    /// device threads have.
+    pub fn host_ptr(&self, gpa: u64, len: usize) -> Option<*mut u8> {
+        let (region, offset) = self.region_for(gpa, len)?;
+        // SAFETY: `region_for` proved offset + len is inside the mapping.
+        Some(unsafe { region.host.add(offset) })
+    }
+
     fn fault(gpa: u64, len: usize, what: &str) -> libvmm_core::error::VmmError {
         KvmError::MemoryMap {
             size_mb: 0,

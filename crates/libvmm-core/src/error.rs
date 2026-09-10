@@ -218,6 +218,17 @@ pub enum StorageError {
     /// 4012 — the engine cannot take a snapshot (surfaces as 8001 in backup).
     #[error("engine {engine} cannot snapshot")]
     SnapshotUnsupported { engine: &'static str },
+    /// 4013 — a per-queue worker thread could not be started at
+    /// `DEVICE_INIT`. Every request queue has its own worker (§5.1), so a
+    /// controller short of one has a queue nothing will ever drain — which
+    /// hangs the guest rather than failing it. Refusing to build the device
+    /// is the only safe answer.
+    #[error("{controller}: queue {queue} worker could not be started: {detail}")]
+    QueueWorkerSpawn {
+        controller: String,
+        queue: u16,
+        detail: String,
+    },
 }
 
 impl StorageError {
@@ -230,6 +241,7 @@ impl StorageError {
             StorageError::UnmapUnsupported { .. } => 4010,
             StorageError::UnsupportedCdb { .. } => 4011,
             StorageError::SnapshotUnsupported { .. } => 4012,
+            StorageError::QueueWorkerSpawn { .. } => 4013,
         }
     }
 }

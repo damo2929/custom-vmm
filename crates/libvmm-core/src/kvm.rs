@@ -519,6 +519,17 @@ mod live {
             &self.map
         }
 
+        /// A wall clock reading the same source the guest's paravirtual
+        /// clock does. Hand this to
+        /// [`DeviceModel::set_wall_clock`](crate::devices::DeviceModel::set_wall_clock)
+        /// so the RTC and `ptp_kvm` cannot disagree.
+        pub fn wall_clock(&self) -> std::sync::Arc<dyn crate::devices::WallClock> {
+            std::sync::Arc::new(KvmWallClock {
+                vm: std::sync::Arc::clone(&self.vm),
+                reported: std::sync::atomic::AtomicU8::new(SOURCE_UNKNOWN),
+            })
+        }
+
         pub fn take_vcpus(&mut self) -> Vec<VcpuFd> {
             std::mem::take(&mut self.vcpus)
         }
@@ -674,6 +685,55 @@ mod live {
             if let Err(e) = self.vm.signal_msi(msi) {
                 log::warn!("signal_msi({address:#x}, {data:#x}) failed: {e}");
             }
+        }
+    }
+
+    /// Publishes a device's framebuffer to the guest as a KVM memory slot.
+    ///
+    /// See [`crate::devices::GuestRamMapper`] for why a framebuffer BAR
+    /// cannot be an ordinary trapping MMIO region.
+    pub struct KvmRamMapper {
+        vm: std::sync::Arc<VmFd>,
+    }
+
+    impl KvmRamMapper {
+        pub fn new(vm: std::sync::Arc<VmFd>) -> Self {
+            KvmRamMapper { vm }
+        }
+
+        fn set(&self, slot: u32, gpa: u64, host: u64, len: u64) -> VmmResult<()> {
+            let region = kvm_userspace_memory_region {
+                slot,
+                guest_phys_addr: gpa,
+                memory_size: len,
+                userspace_addr: host,
+                flags: 0,
+            };
+            // SAFETY: `host` is the base of a live mapping of at least
+            // `len` bytes owned by the caller, which keeps it alive for as
+            // long as the slot is registered. A `memory_size` of zero
+            // deletes the slot, and KVM ignores `userspace_addr` then.
+            unsafe { self.vm.set_user_memory_region(region) }.map_err(|e| {
+                KvmError::SetMemRegion {
+                    slot,
+                    detail: e.to_string(),
+                }
+                .into()
+            })
+        }
+    }
+
+    impl crate::devices::GuestRamMapper for KvmRamMapper {
+        fn remap(&self, slot: u32, gpa: u64, host: u64, len: u64) -> VmmResult<()> {
+            self.set(slot, gpa, host, len)
+        }
+
+        /// A zero `memory_size` is how KVM is told to drop a slot — and
+        /// `__kvm_set_memory_region` answers `EINVAL` if the slot was not
+        /// registered in the first place, so the caller has to know whether
+        /// it published one. [`crate::display::BochsDisplay`] does.
+        fn unmap(&self, slot: u32) -> VmmResult<()> {
+            self.set(slot, 0, 0, 0)
         }
     }
 
@@ -852,10 +912,95 @@ mod live {
         })?;
         Ok(())
     }
+
+    /// The host wall clock, read through `KVM_GET_CLOCK`.
+    ///
+    /// This is deliberately the *same* kernel call path the guest's own
+    /// `ptp_kvm` driver ends up on. `KVM_HC_CLOCK_PAIRING`, which is what
+    /// `ptp_kvm` issues, and `KVM_GET_CLOCK` with `KVM_CLOCK_REALTIME` both
+    /// resolve to `ktime_get_snapshot()` — one host-realtime reading taken
+    /// against one TSC reading. Asking through this interface rather than
+    /// `gettimeofday` is what makes the RTC agree with the guest's PTP
+    /// clock instead of merely being close to it.
+    ///
+    /// `KVM_CLOCK_REALTIME` arrived in Linux 5.16. On anything older the
+    /// kernel leaves the flag and the field clear, so the fallback below is
+    /// a genuine possibility rather than defensive padding — and it is
+    /// silent, because an RTC that is right to the second on an old kernel
+    /// is not a fault worth logging once per read.
+    pub struct KvmWallClock {
+        vm: std::sync::Arc<VmFd>,
+        /// Which source the last read came from, so a change is announced
+        /// once instead of every time.
+        reported: std::sync::atomic::AtomicU8,
+    }
+
+    const SOURCE_UNKNOWN: u8 = 0;
+    const SOURCE_KVM: u8 = 1;
+    const SOURCE_HOST: u8 = 2;
+
+    impl KvmWallClock {
+        /// The host realtime KVM reports, or `None` where the kernel does
+        /// not fill it in.
+        pub fn kvm_realtime(&self) -> Option<u64> {
+            let clock = self.vm.get_clock().ok()?;
+            if clock.flags & kvm_bindings::KVM_CLOCK_REALTIME != 0 && clock.realtime != 0 {
+                Some(clock.realtime)
+            } else {
+                None
+            }
+        }
+    }
+
+    impl crate::devices::WallClock for KvmWallClock {
+        fn realtime_nanos(&self) -> u128 {
+            match self.kvm_realtime() {
+                Some(ns) => {
+                    self.announce(SOURCE_KVM);
+                    u128::from(ns)
+                }
+                None => {
+                    self.announce(SOURCE_HOST);
+                    crate::devices::SystemWallClock.realtime_nanos()
+                }
+            }
+        }
+    }
+
+    impl KvmWallClock {
+        /// Say which clock is answering, the first time and on any change.
+        ///
+        /// It changes in practice, and the reason is worth knowing: KVM only
+        /// publishes a realtime pairing once its master clock is up, which
+        /// needs a vCPU to have enabled kvmclock and the host clocksource to
+        /// be the TSC. Probing at bring-up therefore always reports the
+        /// fallback, because no vCPU has run yet. Announcing on change
+        /// rather than once at construction is what makes the log say what
+        /// is actually true during the run.
+        fn announce(&self, source: u8) {
+            use std::sync::atomic::Ordering;
+            if self.reported.swap(source, Ordering::Relaxed) == source {
+                return;
+            }
+            match source {
+                SOURCE_KVM => log::info!(
+                    "RTC clock source: KVM_GET_CLOCK realtime — the same \
+                     ktime_get_snapshot() pairing the guest's ptp_kvm reads"
+                ),
+                _ => log::info!(
+                    "RTC clock source: host CLOCK_REALTIME — KVM is not \
+                     reporting KVM_CLOCK_REALTIME yet (it needs the master \
+                     clock up: a vCPU running kvmclock, and a TSC host \
+                     clocksource), so the RTC and the guest's paravirtual \
+                     clock are separate samples of the same epoch"
+                ),
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
-pub use live::{configure_pvh_entry, KvmMsiSender, Machine};
+pub use live::{configure_pvh_entry, KvmMsiSender, KvmRamMapper, KvmWallClock, Machine};
 
 #[cfg(test)]
 mod tests {

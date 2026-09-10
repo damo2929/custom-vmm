@@ -24,6 +24,9 @@ pub const SENSE_KEY_NOT_READY: u8 = 0x02;
 pub const SENSE_KEY_MEDIUM_ERROR: u8 = 0x03;
 pub const SENSE_KEY_ILLEGAL_REQUEST: u8 = 0x05;
 pub const SENSE_KEY_HARDWARE_ERROR: u8 = 0x04;
+/// The medium is write-protected. Distinct from a hardware error on
+/// purpose: a guest retries the second forever and reports the first.
+pub const SENSE_KEY_DATA_PROTECT: u8 = 0x07;
 
 pub const ASC_INVALID_COMMAND_OPCODE: (u8, u8) = (0x20, 0x00);
 pub const ASC_LBA_OUT_OF_RANGE: (u8, u8) = (0x21, 0x00);
@@ -31,6 +34,9 @@ pub const ASC_INVALID_FIELD_IN_CDB: (u8, u8) = (0x24, 0x00);
 pub const ASC_LOGICAL_UNIT_NOT_SUPPORTED: (u8, u8) = (0x25, 0x00);
 pub const ASC_LOGICAL_UNIT_NOT_READY: (u8, u8) = (0x04, 0x00);
 pub const ASC_INTERNAL_TARGET_FAILURE: (u8, u8) = (0x44, 0x00);
+/// An optical drive with no disc in it.
+pub const ASC_MEDIUM_NOT_PRESENT: (u8, u8) = (0x3A, 0x00);
+pub const ASC_WRITE_PROTECTED: (u8, u8) = (0x27, 0x00);
 
 // -- CDB opcodes we handle (§5.3) -------------------------------------------
 
@@ -101,13 +107,35 @@ impl RequestHeader {
         })
     }
 
-    /// The LUN encoding is `1, target, 0, lun, ...` (§5.2).
+    /// The target, from byte 1 of the eight-byte LUN (virtio 1.x §5.6.6.1).
+    ///
+    /// Byte 0 is always 1.
     pub const fn target(&self) -> u8 {
         self.lun[1]
     }
 
+    /// The logical unit, from bytes 2 and 3.
+    ///
+    /// These are **not** a plain big-endian `u16`. virtio-scsi carries the
+    /// LUN in SAM's single-level addressing form, so byte 2 is
+    /// `0x40 | (lun >> 8)` and byte 3 is `lun & 0xFF` — the top two bits are
+    /// an address-method field, not part of the number. edk2 writes it
+    /// exactly that way:
+    ///
+    /// ```c
+    /// Request->Lun[2] = (UINT8)(((Lun >> 8) & 0x3F) | 0x40);
+    /// Request->Lun[3] = (UINT8)(Lun & 0xFF);
+    /// ```
+    ///
+    /// Reading byte 2 raw turns LUN 0 into `0x4000`, so every command from
+    /// a conforming initiator is answered `BAD_TARGET`. The symptom is a
+    /// controller that negotiates features, sets DRIVER_OK and then appears
+    /// to have nothing behind it: the firmware installs its pass-through
+    /// protocol, scans, finds no logical unit, and never creates a block
+    /// device. Linux's virtio_scsi happens to send `0x40` too, so this is
+    /// not an edk2 quirk — it was simply never exercised.
     pub const fn logical_unit(&self) -> u16 {
-        ((self.lun[2] as u16) << 8) | self.lun[3] as u16
+        (((self.lun[2] & 0x3F) as u16) << 8) | self.lun[3] as u16
     }
 
     pub const fn opcode(&self) -> u8 {
@@ -214,10 +242,29 @@ pub struct DriveIdentity {
     pub revision: [u8; 4],
     /// VPD page 0x83 designator: the drive_id.
     pub drive_id: u32,
+    /// What the guest is told this drive is (§5.3, Revision E). Decides the
+    /// peripheral device type, the removable bit, and whether VPD page 0xB1
+    /// reports a rotation rate.
+    pub medium: libvmm_config::DriveMedium,
+    /// Whether a medium is loaded. Always true for a fixed disk; for an
+    /// optical drive it is false when no ISO is attached, which is a
+    /// working drive with an empty tray rather than an absent one.
+    pub medium_present: bool,
 }
 
 impl DriveIdentity {
+    /// A fixed solid-state disk — the default this tree had before media
+    /// were configurable.
     pub fn new(drive_id: u32, engine: libvmm_config::EngineKind) -> Self {
+        Self::with_medium(drive_id, engine, libvmm_config::DriveMedium::Ssd, true)
+    }
+
+    pub fn with_medium(
+        drive_id: u32,
+        engine: libvmm_config::EngineKind,
+        medium: libvmm_config::DriveMedium,
+        medium_present: bool,
+    ) -> Self {
         let mut vendor = [b' '; 8];
         vendor[..4].copy_from_slice(b"RUST");
         let mut model = [b' '; 16];
@@ -230,6 +277,8 @@ impl DriveIdentity {
             model,
             revision: *b"0001",
             drive_id,
+            medium,
+            medium_present,
         }
     }
 }
@@ -243,8 +292,24 @@ pub fn dispatch(
     data_out: &[u8],
 ) -> CommandOutcome {
     let cdb = &req.cdb;
+
+    // An optical drive answers a different command set. Opcodes the MMC
+    // module claims go there whole; the ones both sets share — INQUIRY,
+    // READ, READ CAPACITY, MODE SENSE — stay here and consult `id.medium`,
+    // because their *answers* differ rather than their meaning.
+    if id.medium.is_optical() && crate::mmc::claims(cdb[0]) {
+        return crate::mmc::dispatch(cdb, engine, id.medium, id.medium_present);
+    }
+
     match cdb[0] {
-        TEST_UNIT_READY => immediate(ResponseHeader::default(), Vec::new()),
+        TEST_UNIT_READY => {
+            // The one command whose whole purpose is to say whether there is
+            // a medium to talk to.
+            if id.medium.is_optical() && !id.medium_present {
+                return crate::mmc::no_medium();
+            }
+            immediate(ResponseHeader::default(), Vec::new())
+        }
 
         REQUEST_SENSE => {
             // No deferred error is pending, so report NO SENSE.
@@ -255,6 +320,19 @@ pub fn dispatch(
         }
 
         INQUIRY => inquiry(cdb, id, engine),
+
+        READ_CAPACITY_10 | SERVICE_ACTION_IN_16 | READ_10 | READ_16
+            if id.medium.is_optical() && !id.medium_present =>
+        {
+            crate::mmc::no_medium()
+        }
+
+        // Optical media are ROM. This catches the block-path writes; the
+        // MMC-only write opcodes are refused in `mmc::dispatch`.
+        WRITE_10 | WRITE_16 | UNMAP if id.medium.is_read_only() => immediate(
+            ResponseHeader::check_condition(SENSE_KEY_DATA_PROTECT, ASC_WRITE_PROTECTED),
+            Vec::new(),
+        ),
 
         READ_CAPACITY_10 => {
             let last = engine.capacity_blocks().saturating_sub(1);
@@ -273,7 +351,7 @@ pub fn dispatch(
             d[8..12].copy_from_slice(&engine.block_size().to_be_bytes());
             // LBPME (bit 7 of byte 14) advertises thin provisioning, so the
             // guest knows UNMAP is meaningful (§5.3).
-            if discard_enabled {
+            if discard_enabled && id.medium.supports_discard() {
                 d[14] |= 0x80;
             }
             immediate(ResponseHeader::default(), d)
@@ -296,7 +374,7 @@ pub fn dispatch(
         SYNCHRONIZE_CACHE_10 | SYNCHRONIZE_CACHE_16 => CommandOutcome::Flush,
 
         UNMAP => {
-            if !discard_enabled {
+            if !discard_enabled || !id.medium.supports_discard() {
                 return immediate(
                     ResponseHeader::check_condition(
                         SENSE_KEY_ILLEGAL_REQUEST,
@@ -324,7 +402,7 @@ pub fn dispatch(
             immediate(ResponseHeader::default(), d)
         }
 
-        MODE_SENSE_6 | MODE_SENSE_10 => mode_sense(cdb, engine, discard_enabled),
+        MODE_SENSE_6 | MODE_SENSE_10 => mode_sense(cdb, engine, discard_enabled, id.medium),
 
         START_STOP_UNIT => immediate(ResponseHeader::default(), Vec::new()),
 
@@ -341,11 +419,16 @@ pub fn dispatch(
     }
 }
 
-fn immediate(response: ResponseHeader, data: Vec<u8>) -> CommandOutcome {
+pub(crate) fn immediate(response: ResponseHeader, data: Vec<u8>) -> CommandOutcome {
     CommandOutcome::Immediate { response, data }
 }
 
-fn transfer(is_read: bool, lba: u64, blocks: u32, engine: &dyn StorageEngine) -> CommandOutcome {
+pub(crate) fn transfer(
+    is_read: bool,
+    lba: u64,
+    blocks: u32,
+    engine: &dyn StorageEngine,
+) -> CommandOutcome {
     if let Err(e) = engine.check_range(lba, blocks as u64) {
         log::debug!("virtio-scsi: {e}");
         return immediate(
@@ -380,8 +463,12 @@ fn inquiry(cdb: &[u8; 32], id: &DriveIdentity, engine: &dyn StorageEngine) -> Co
             );
         }
         let mut d = vec![0u8; 36];
-        d[0] = 0x00; // direct-access block device
-        d[1] = 0x00; // not removable
+        // Byte 0 is the peripheral device type, and it is the first thing a
+        // guest reads: 0x00 binds Linux's `sd`, 0x05 binds `sr`. Byte 1 bit
+        // 7 is RMB — a removable medium, which is what makes a guest poll
+        // for disc changes rather than assume the medium is permanent.
+        d[0] = id.medium.peripheral_device_type();
+        d[1] = if id.medium.is_removable() { 0x80 } else { 0x00 };
         d[2] = 0x06; // SPC-4
         d[3] = 0x02; // response data format 2
         d[4] = 31; // additional length
@@ -392,13 +479,20 @@ fn inquiry(cdb: &[u8; 32], id: &DriveIdentity, engine: &dyn StorageEngine) -> Co
     }
 
     match page {
-        // Supported VPD pages.
+        // Supported VPD pages. The block-characteristics and provisioning
+        // pages describe a block device; an optical drive does not offer
+        // them, and listing a page that is then refused is worse than not
+        // listing it.
         0x00 => {
-            let pages = [0x00u8, 0x80, 0x83, 0xB0, 0xB2];
+            let pages: &[u8] = if id.medium.is_optical() {
+                &[0x00, 0x80, 0x83]
+            } else {
+                &[0x00, 0x80, 0x83, 0xB0, 0xB1, 0xB2]
+            };
             let mut d = vec![0u8; 4 + pages.len()];
             d[1] = 0x00;
             d[2..4].copy_from_slice(&(pages.len() as u16).to_be_bytes());
-            d[4..].copy_from_slice(&pages);
+            d[4..].copy_from_slice(pages);
             immediate(ResponseHeader::default(), d)
         }
         // Unit serial number.
@@ -426,7 +520,7 @@ fn inquiry(cdb: &[u8; 32], id: &DriveIdentity, engine: &dyn StorageEngine) -> Co
             immediate(ResponseHeader::default(), d)
         }
         // Block limits: advertise the UNMAP granularity.
-        0xB0 => {
+        0xB0 if !id.medium.is_optical() => {
             let mut d = vec![0u8; 64];
             d[1] = 0xB0;
             d[2..4].copy_from_slice(&60u16.to_be_bytes());
@@ -435,8 +529,25 @@ fn inquiry(cdb: &[u8; 32], id: &DriveIdentity, engine: &dyn StorageEngine) -> Co
             d[24..28].copy_from_slice(&0x00FF_FFFFu32.to_be_bytes());
             immediate(ResponseHeader::default(), d)
         }
+        // Block device characteristics (SBC-4 §B.2). This page exists here
+        // for one field: MEDIUM ROTATION RATE at bytes 4-5. `1` means
+        // non-rotating, and it is the *only* way a SCSI initiator learns
+        // that a disk is solid-state. Linux publishes it as
+        // `/sys/block/sdX/queue/rotational`, and the I/O scheduler,
+        // readahead and discard policy all key off that one bit.
+        0xB1 if !id.medium.is_optical() => {
+            let mut d = vec![0u8; 64];
+            d[1] = 0xB1;
+            d[2..4].copy_from_slice(&60u16.to_be_bytes());
+            if let Some(rpm) = id.medium.rotation_rate() {
+                d[4..6].copy_from_slice(&rpm.to_be_bytes());
+            }
+            // Nominal form factor 0 — not reported. A virtual disk has no
+            // physical size and claiming one would be a fabrication.
+            immediate(ResponseHeader::default(), d)
+        }
         // Logical block provisioning.
-        0xB2 => {
+        0xB2 if !id.medium.is_optical() => {
             let mut d = vec![0u8; 8];
             d[1] = 0xB2;
             d[2..4].copy_from_slice(&4u16.to_be_bytes());
@@ -454,7 +565,12 @@ fn inquiry(cdb: &[u8; 32], id: &DriveIdentity, engine: &dyn StorageEngine) -> Co
 }
 
 /// MODE SENSE with the caching page, reporting a write-back cache.
-fn mode_sense(cdb: &[u8; 32], engine: &dyn StorageEngine, _discard: bool) -> CommandOutcome {
+fn mode_sense(
+    cdb: &[u8; 32],
+    engine: &dyn StorageEngine,
+    _discard: bool,
+    medium: libvmm_config::DriveMedium,
+) -> CommandOutcome {
     let ten_byte = cdb[0] == MODE_SENSE_10;
     let page_code = cdb[2] & 0x3F;
 
@@ -467,16 +583,27 @@ fn mode_sense(cdb: &[u8; 32], engine: &dyn StorageEngine, _discard: bool) -> Com
         p[2] = 0x04; // WCE
         pages.extend_from_slice(&p);
     }
+    // Page 0x2A is what Linux's `sr` reads to learn what the drive can do.
+    // It was removed in MMC-6 and `sr` asks for it anyway.
+    if medium.is_optical() && matches!(page_code, 0x2A | 0x3F) {
+        pages.extend_from_slice(&crate::mmc::mm_capabilities_page());
+    }
 
     let block_size = engine.block_size();
     let mut d = Vec::new();
+    // The write-protect bit lives in the device-specific parameter byte,
+    // which is byte 2 of a 6-byte header and byte 3 of a 10-byte one. A
+    // guest reads it before mounting and mounts read-only if it is set,
+    // which is how a disc mounts cleanly instead of failing on the first
+    // journal replay.
+    let write_protected = if medium.is_read_only() { 0x80 } else { 0x00 };
     if ten_byte {
         let len = 6 + pages.len();
         d.extend_from_slice(&(len as u16).to_be_bytes());
-        d.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        d.extend_from_slice(&[0, write_protected, 0, 0, 0, 0]);
     } else {
         d.push((3 + pages.len()) as u8);
-        d.extend_from_slice(&[0, 0, 0]);
+        d.extend_from_slice(&[0, write_protected, 0]);
     }
     d.extend_from_slice(&pages);
     let _ = block_size;
