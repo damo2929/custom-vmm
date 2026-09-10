@@ -1,2 +1,22 @@
 # Checked in. The [build] section below is an architectural decision and
-# applies on every machine; the
+# applies on every machine; the [env] section at the end is machine-local and
+# is rewritten by scripts/setup-local-sysroot.sh.
+
+[build]
+# §Host requirements: the baseline ISA is x86-64-v3 (AVX2, BMI1/2, FMA, MOVBE,
+# F16C, LZCNT). Every server CPU since Haswell (2013) and Zen 1 (2017) has it.
+#
+# This is not micro-optimisation for its own sake. The hot paths in this tree
+# are byte movers — virtqueue descriptor walks, framebuffer format conversion,
+# AV1 packetisation, checksum and copy loops — and at the default
+# `x86-64` baseline LLVM must assume SSE2 only, so it emits 16-byte steps for
+# work the host can do 32 bytes at a time, and calls out to libgcc for the
+# bit-scan and count-leading-zero idioms the queue code uses.
+#
+# The cost is that a binary built here will raise SIGILL on a pre-2013 CPU
+# rather than run slowly. That is the intended trade: this is host software
+# for a machine that is also expected to run VMs.
+rustflags = ["-C", "target-cpu=x86-64-v3"]
+
+[env]
+VMM_SYSROOT = "/tmp/claude-1000/-home-damien-hypervisor/a4a97900-f49f-4fff-adcc-8a96f39a7268/scratchpad/sysroot/sysroot"

@@ -409,13 +409,15 @@ fn build_slit() -> Vec<u8> {
 
 /// DSDT — PCIe root with `_OSC`, a power button, and the reset method.
 ///
-/// The AML here is a hand-assembled minimum: a `_SB.PCI0` device with the
-/// PNP0A08 (PCIe) HID, and a PNP0C0C power button so the guest raises an SCI
-/// on the WSS `powerdown` action (§8.5).
+/// The AML here is hand-assembled: a `_SB.PCI0` device with the PNP0A08
+/// (PCIe) HID and a `_CRS` describing everything the bridge decodes, a
+/// PNP0C0C power button so the guest raises an SCI on the WSS `powerdown`
+/// action (§8.5), and `\_S5` so it has an ACPI way to switch itself off.
 fn build_dsdt() -> Vec<u8> {
     let mut t = Vec::new();
     SdtHeader::new(b"DSDT", 2, b"RVMMDSDT").write_into(&mut t);
     t.extend_from_slice(&aml::pcie_root_and_power_button());
+    t.extend_from_slice(&aml::s5_package());
     finalize(&mut t);
     t
 }
@@ -568,11 +570,17 @@ fn gas_io(address: u64, bit_width: u8) -> [u8; 12] {
 
 /// Minimal hand-assembled AML for the DSDT body.
 mod aml {
+    use crate::memory;
+
     const OP_SCOPE: u8 = 0x10;
     const OP_DEVICE_EXT: [u8; 2] = [0x5B, 0x82];
     const OP_NAME: u8 = 0x08;
     const OP_STRING: u8 = 0x0D;
     const OP_DWORD: u8 = 0x0C;
+    const OP_BYTE: u8 = 0x0A;
+    const OP_WORD: u8 = 0x0B;
+    const OP_BUFFER: u8 = 0x11;
+    const OP_PACKAGE: u8 = 0x12;
 
     /// `_SB` containing `PCI0` (PNP0A08) and `PWRB` (PNP0C0C).
     pub fn pcie_root_and_power_button() -> Vec<u8> {
@@ -586,14 +594,80 @@ mod aml {
         out
     }
 
+    /// `\_S5`, the soft-off package. Without it an operating system has no
+    /// ACPI way to power the machine down and says so.
+    pub fn s5_package() -> Vec<u8> {
+        let mut inner = vec![2u8]; // element count
+        inner.push(OP_BYTE);
+        inner.push(5); // PM1a sleep type: S5
+        inner.push(OP_BYTE);
+        inner.push(0); // PM1b
+        let mut pkg = vec![OP_PACKAGE];
+        pkg.extend_from_slice(&pkg_length(inner.len()));
+        pkg.extend_from_slice(&inner);
+
+        let mut v = vec![OP_NAME];
+        v.extend_from_slice(b"_S5_");
+        v.extend_from_slice(&pkg);
+        v
+    }
+
+    /// The PCIe root bridge.
+    ///
+    /// `_CRS` is the part that matters and the part that was missing. A
+    /// root bridge's current resource settings are how an operating system
+    /// learns which bus numbers, which I/O ports and which stretches of
+    /// physical address space belong to this bridge — that is, where it is
+    /// allowed to place a BAR. Linux will fall back to the MCFG table and
+    /// the host bridge's own registers when it is absent. Windows will not:
+    /// its ACPI driver treats a root bridge with no resources as a
+    /// malformed namespace, and the failure arrives before there is a
+    /// screen to report it on.
     fn pci0_body() -> Vec<u8> {
         let mut b = Vec::new();
         b.extend_from_slice(&name_eisaid("_HID", 0x0A08_D041)); // PNP0A08, PCIe
         b.extend_from_slice(&name_eisaid("_CID", 0x030A_D041)); // PNP0A03, PCI
+        b.extend_from_slice(&name_dword("_ADR", 0));
+        b.extend_from_slice(&name_dword("_SEG", 0));
         b.extend_from_slice(&name_dword("_UID", 0));
         b.extend_from_slice(&name_dword("_BBN", 0));
+        // `_CCA`: the bus is cache-coherent. Absent, Windows on some
+        // platforms assumes it is not and maps everything uncached.
+        b.extend_from_slice(&name_dword("_CCA", 1));
         b.extend_from_slice(&name_string("_STR", "PCIe Root Bridge"));
+        b.extend_from_slice(&name_buffer("_CRS", &pci0_resources()));
         b
+    }
+
+    /// What the root bridge decodes.
+    fn pci0_resources() -> Vec<u8> {
+        let mut r = Vec::new();
+        // Bus numbers 0..0. One bus: there are no bridges on this machine,
+        // so there is nothing below it to number.
+        r.extend_from_slice(&word_address_space(RESOURCE_BUS, 0, 0, 1));
+        // The configuration ports. Consumed by the bridge, not handed out.
+        r.extend_from_slice(&io_port(0x0CF8, 8));
+        // The ECAM window, which is the bridge's own aperture.
+        r.extend_from_slice(&memory32_fixed(
+            memory::ECAM_BASE as u32,
+            memory::ECAM_SIZE as u32,
+        ));
+        // The 32-bit BAR window: what firmware and the operating system may
+        // place devices in.
+        r.extend_from_slice(&dword_address_space(
+            RESOURCE_MEMORY,
+            memory::PCI_MMIO_BASE as u32,
+            memory::PCI_MMIO_END as u32,
+        ));
+        // I/O space, in the two halves either side of the configuration
+        // ports. Nothing on this machine has an I/O BAR, but a root bridge
+        // that decodes no I/O at all is a shape firmware does not expect.
+        r.extend_from_slice(&word_address_space(RESOURCE_IO, 0x0000, 0x0CF7, 0x0CF8));
+        r.extend_from_slice(&word_address_space(RESOURCE_IO, 0x0D00, 0xFFFF, 0xF300));
+        // End tag, with a zero checksum — which the specification allows and
+        // every producer uses.
+        r.extend_from_slice(&[0x79, 0x00]);
+        r
     }
 
     fn pwrb_body() -> Vec<u8> {
@@ -601,6 +675,103 @@ mod aml {
         b.extend_from_slice(&name_eisaid("_HID", 0x0C0C_D041)); // PNP0C0C
         b.extend_from_slice(&name_dword("_UID", 0));
         b
+    }
+
+    const RESOURCE_MEMORY: u8 = 0;
+    const RESOURCE_IO: u8 = 1;
+    const RESOURCE_BUS: u8 = 2;
+
+    /// A large resource descriptor: tag, 16-bit length, then the body.
+    fn large_descriptor(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut v = vec![tag];
+        v.extend_from_slice(&(body.len() as u16).to_le_bytes());
+        v.extend_from_slice(body);
+        v
+    }
+
+    /// The three flag bytes every address-space descriptor starts with, and
+    /// the five values that follow: granularity, min, max, translation and
+    /// length.
+    fn address_space_body(kind: u8, min: u64, max: u64, width: usize) -> Vec<u8> {
+        let mut b = vec![kind];
+        // General flags: bit 0 clear = this bridge *produces* the range, and
+        // subtractive/positive decode is bit 1. Bits 2 and 3 mark min and
+        // max as fixed, which they are.
+        b.push(0b0000_1100);
+        // Type-specific flags. For memory: read/write, non-cacheable. For
+        // I/O and bus numbers the field is either a range type or reserved.
+        b.push(match kind {
+            RESOURCE_MEMORY => 0x01, // read/write
+            RESOURCE_IO => 0x03,     // both ISA and non-ISA ranges
+            _ => 0x00,
+        });
+        let length = max.wrapping_sub(min).wrapping_add(1);
+        for value in [0u64, min, max, 0, length] {
+            b.extend_from_slice(&value.to_le_bytes()[..width]);
+        }
+        b
+    }
+
+    fn word_address_space(kind: u8, min: u16, max: u16, _length: u16) -> Vec<u8> {
+        large_descriptor(
+            0x88,
+            &address_space_body(kind, u64::from(min), u64::from(max), 2),
+        )
+    }
+
+    fn dword_address_space(kind: u8, min: u32, max: u32) -> Vec<u8> {
+        large_descriptor(
+            0x87,
+            &address_space_body(kind, u64::from(min), u64::from(max), 4),
+        )
+    }
+
+    /// A fixed 32-bit memory range: tag 0x86, nine bytes.
+    fn memory32_fixed(base: u32, length: u32) -> Vec<u8> {
+        let mut b = vec![0x01u8]; // write status: read/write
+        b.extend_from_slice(&base.to_le_bytes());
+        b.extend_from_slice(&length.to_le_bytes());
+        large_descriptor(0x86, &b)
+    }
+
+    /// A small I/O port descriptor: tag 0x47, seven bytes of body.
+    fn io_port(base: u16, length: u8) -> Vec<u8> {
+        vec![
+            0x47,
+            0x01, // 16-bit decode
+            base as u8,
+            (base >> 8) as u8,
+            base as u8,
+            (base >> 8) as u8,
+            1, // alignment
+            length,
+        ]
+    }
+
+    /// `Name(<name>, Buffer(<len>) { .. })`.
+    fn name_buffer(name: &str, bytes: &[u8]) -> Vec<u8> {
+        // The buffer's declared size is a TermArg; a byte or word constant
+        // covers everything this tree emits.
+        let mut size = Vec::new();
+        if bytes.len() <= u8::MAX as usize {
+            size.push(OP_BYTE);
+            size.push(bytes.len() as u8);
+        } else {
+            size.push(OP_WORD);
+            size.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+        }
+
+        let mut inner = size;
+        inner.extend_from_slice(bytes);
+
+        let mut buffer = vec![OP_BUFFER];
+        buffer.extend_from_slice(&pkg_length(inner.len()));
+        buffer.extend_from_slice(&inner);
+
+        let mut v = vec![OP_NAME];
+        v.extend_from_slice(name.as_bytes());
+        v.extend_from_slice(&buffer);
+        v
     }
 
     fn device(name: &str, body: &[u8]) -> Vec<u8> {
