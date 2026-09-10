@@ -1,0 +1,7 @@
+/target
+**/*.rs.bk
+*.vmbk
+
+# Written by scripts/setup-local-sysroot.sh; machine-specific.
+.cargo/config.toml
+.sysroot/

@@ -1,0 +1,15 @@
+[package]
+name = "vmm-rbd-sys"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "librados/librbd bindings for the rust_ceph_rbd engine — §5.4."
+links = "vmm-rbd"
+
+[dependencies]
+libc = { workspace = true }
+
+[build-dependencies]
+vmm-sysdeps = { workspace = true }

@@ -1,0 +1,69 @@
+# Dependency policy.
+#
+# §1.1 originally required that no C library be linked and that `cargo-deny`
+# fail the build on any transitive C dependency. That rule was **lifted**: it
+# blocked TLS 1.3 (§8.2), both codecs (§7.1), zstd (§10.3) and RADOS (§5.4),
+# none of which have a production-grade pure-Rust replacement.
+#
+# What replaces it is an allow-list. C dependencies are permitted, but only
+# the ones we chose deliberately — a new `-sys` crate arriving as a
+# transitive dependency of something else still fails the build.
+#
+# `scripts/c-dependency-inventory.sh` prints what is actually linked.
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+# Never acceptable: an alternative TLS/crypto stack arriving by accident, or
+# a duplicate of one we already link.
+deny = [
+    { name = "openssl-sys" },
+    { name = "openssl" },
+    { name = "aws-lc-sys" },
+    { name = "libz-sys" },
+]
+
+# The C dependencies we chose. Each one buys a specific spec section; see
+# HOST-REQUIREMENTS.md §6.
+#
+#   ring       -> TLS 1.3 (§8.2, §7.4, §9.2)
+#   zstd-sys   -> .vmbk compression (§10.3)
+#   cc         -> build scripts, and compiling the libx264 shim
+#   clang-sys  -> libclang, loaded by bindgen at build time only
+#
+# The codec and Ceph libraries are linked directly by vmm-codec-sys and
+# vmm-rbd-sys rather than through a crate, so they never appear here;
+# scripts/c-dependency-inventory.sh checks those.
+skip = [
+    { name = "ring" },
+    { name = "zstd-sys" },
+    { name = "cc" },
+    { name = "clang-sys" },
+]
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "BSD-2-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    # ring's aggregate licence, and zstd's dual licence.
+    "OpenSSL",
+    "GPL-2.0",
+    # bindgen and its clang plumbing.
+    "NCSA",
+    "Apache-2.0 WITH LLVM-exception",
+]
+confidence-threshold = 0.9
+
+[advisories]
+yanked = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

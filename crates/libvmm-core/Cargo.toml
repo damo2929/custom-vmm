@@ -1,0 +1,22 @@
+[package]
+name = "libvmm-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+libvmm-config.workspace = true
+thiserror.workspace = true
+libc.workspace = true
+log.workspace = true
+uuid.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+kvm-ioctls.workspace = true
+kvm-bindings.workspace = true
+vmm-sys-util.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true

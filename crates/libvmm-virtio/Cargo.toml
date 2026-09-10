@@ -1,0 +1,11 @@
+[package]
+name = "libvmm-virtio"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+libvmm-core.workspace = true
+log.workspace = true

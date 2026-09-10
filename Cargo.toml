@@ -1,0 +1,86 @@
+# Legacy-Free Native Rust KVM Hypervisor & Client Suite
+# Workspace topology per Detailed Design Specification §1.1.
+#
+# §1.1's no-C-linkage rule was lifted by the spec owner: it blocked TLS
+# (§8.2), H.264 and Vorbis encode (§7.1), H.264 decode in the client, zstd
+# (§10.3) and RADOS (§5.4), none of which had a usable pure-Rust
+# replacement. What is linked, and why, is inventoried in
+# HOST-REQUIREMENTS.md §6 and enforced as an allow-list by deny.toml;
+# scripts/c-dependency-inventory.sh fails on anything not on that list.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/custom-vmm",
+    "crates/vmm-console-client",
+    "crates/libvmm-config",
+    "crates/libvmm-core",
+    "crates/libvmm-virtio",
+    "crates/libvmm-storage",
+    "crates/libvmm-net",
+    "crates/libvmm-media",
+    "crates/libvmm-control",
+    "crates/libvmm-usbip",
+    "crates/vmm-sysdeps",
+    "crates/vmm-codec-sys",
+    "crates/vmm-rbd-sys",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+libvmm-config  = { path = "crates/libvmm-config" }
+libvmm-core    = { path = "crates/libvmm-core" }
+libvmm-virtio  = { path = "crates/libvmm-virtio" }
+libvmm-storage = { path = "crates/libvmm-storage" }
+libvmm-net     = { path = "crates/libvmm-net" }
+libvmm-media   = { path = "crates/libvmm-media" }
+libvmm-control = { path = "crates/libvmm-control" }
+libvmm-usbip   = { path = "crates/libvmm-usbip" }
+vmm-sysdeps    = { path = "crates/vmm-sysdeps" }
+vmm-codec-sys  = { path = "crates/vmm-codec-sys" }
+vmm-rbd-sys    = { path = "crates/vmm-rbd-sys" }
+
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+toml        = "0.8"
+thiserror   = "1"
+libc        = "0.2"
+log         = "0.4"
+env_logger  = "0.11"
+clap        = { version = "4", features = ["derive"] }
+sha2        = "0.10"
+sha1        = "0.10"
+base64      = "0.22"
+uuid        = { version = "1", features = ["serde"] }
+rustls      = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+zstd        = "0.13"
+tar         = "0.4"
+rcgen       = "0.13"
+bindgen     = "0.70"
+cc          = "1"
+pkg-config  = "0.3"
+# Wayland display for the console client (§7). The default backend is the
+# pure-Rust protocol implementation — it talks the wire format over the
+# compositor socket and does NOT link libwayland.
+wayland-client    = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+kvm-ioctls  = "0.18"
+kvm-bindings = "0.9"
+vmm-sys-util = "0.12"
+
+# §1.1: release builds are panic=abort, thin LTO, single codegen unit.
+[profile.release]
+panic = "abort"
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+debug = 1
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1

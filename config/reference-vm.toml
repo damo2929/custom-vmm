@@ -1,0 +1,163 @@
+# Declarative Machine Configuration Specification (serde, deny_unknown_fields)
+# Verbatim reference machine from Detailed Design Spec §11.
+
+[vm]
+name = "production-windows-workload-01" # SMBIOS Type 1 Serial (literal, 1..63 bytes)
+id = "4b827e8a-86a0-410a-9d32-26db1a0397ce" # SMBIOS UUID
+
+[compute]
+vcpus = 2 # also fixes storage queue count (1:1, no override)
+cpu_passthrough = true
+hypervisor_bit = true
+kvm_ptp_clock = true
+
+[memory]
+size_mb = 8192 # MUST be a whole multiple of 1024 (1GiB hugepages)
+hugepages_1gb = true
+dynamic_allocation = true
+low_ram_mb = 3072 # <= 3072 (ends at/under the MMIO hole)
+high_ram_mb = 5120
+
+[firmware]
+code_path = "/usr/share/OVMF/OVMF_CODE.fd"
+vars_path = "/var/lib/vmm/OVMF_VARS.fd"
+code_start_addr = 0xFFC00000
+
+[firmware.storage]
+engine = "pure_rust_io_uring" # same unified set as disks; persistent by default
+file_path = "/var/lib/vmm/efi_nvram.img"
+
+[display]
+bus = 1
+enabled = true
+width = 1920
+height = 1080
+color_depth_bits = 32
+framerate_cap = 30
+virtio_sound_enabled = true
+
+[display.audio_encoder]
+codec = "ogg_vorbis"
+bitrate_kbps = 128
+sample_rate = 48000
+channels = 2
+
+[display.encoder]
+rate_control = "vbr"
+bitrate_kbps = 1800 # target average
+max_bitrate_kbps = 2000 # hard ceiling; VBR always stays below
+hardware_accelerator = "vaapi" # "vaapi" or "nvenc"
+
+[display.rtsps]
+enabled = true
+stream_path = "/live"
+port = 8554
+ipv6_bind = "[::]"
+tls_min = "1.3" # TLS 1.3 only; cert self-signed at boot
+auth_required = true
+username = "admin" # PLAINTEXT (known limitation)
+password = "hypervisor@01"
+
+[control_wss]
+enabled = true
+port = 8080
+ipv6_bind = "[::]"
+tls_min = "1.3" # TLS 1.3 only; cert self-signed at boot
+auth_required = true
+username = "admin" # PLAINTEXT (known limitation)
+password = "hypervisor@01"
+max_clients = 2 # hard cap; 3rd rejected at handshake
+max_auth_attempts = 10 # lockout threshold
+lockout_duration_secs = 300 # configurable lockout window
+
+[peripherals]
+bus = 2
+keyboard_slot = 0
+tablet_slot = 1
+rng_slot = 2
+serial_slot = 3
+tpm_slot = 4
+
+[tpm]
+enabled = true
+version = "2.0"
+
+[tpm.storage]
+engine = "pure_rust_io_uring" # persistent engines only - volatile REJECTED
+file_path = "/var/lib/vmm/tpm_state.img"
+
+[acpi]
+enabled = true
+msdm_path = "/etc/vmm/acpi/msdm.bin"
+slic_path = "/etc/vmm/acpi/slic.bin"
+
+[storage]
+bus = 3
+# num_queues removed - always equals vcpus (1:1 invariant)
+thread_per_vcpu = true
+sqpoll_thread = true
+discard_unmap = true # SCSI UNMAP (0x42)
+max_discard_sectors = 2097152
+
+[[storage.drives]]
+drive_id = 0
+bootable = true
+type = "virtio_scsi"
+engine = "pure_rust_io_uring" # snapshot-capable (reflink on CoW FS)
+file_path = "/var/lib/vmm/disks/boot_os.raw"
+socket_path = "/var/run/vmm-vhost-scsi0.sock"
+
+[[storage.drives]]
+drive_id = 1
+bootable = false
+type = "virtio_scsi"
+engine = "rust_nvme" # NOT snapshot-capable - excluded from backup
+pci_bdf = "0000:04:00.0" # host NVMe device (backing), not a guest bus
+nsid = 1
+socket_path = "/var/run/vmm-vhost-scsi1.sock"
+
+[[storage.drives]]
+drive_id = 2
+bootable = false
+type = "virtio_scsi"
+engine = "rust_ceph_rbd" # snapshot-capable (native RBD snapshot)
+cluster_config = "/etc/ceph/ceph.conf"
+cluster_name = "rados_cluster_0"
+pool_name = "vms"
+rbd_image = "production-data-vol01"
+socket_path = "/var/run/vmm-vhost-scsi2.sock"
+
+[[storage.drives]]
+drive_id = 3
+bootable = false
+type = "virtio_scsi"
+engine = "rust_hugepage_file" # volatile scratch - NOT snapshot-capable
+file_path = "/dev/hugepages/fast_scratch.mem"
+shared_mem_size_mb = 1024
+socket_path = "/var/run/vmm-vhost-scsi3.sock"
+
+[network]
+bus = 6
+engine = "rust_af_xdp"
+num_queue_pairs = 2
+ipv6_only = false
+bind_address = "[::]"
+
+[[network.cards]]
+card_id = 0
+mac_address = "52:54:00:12:34:56"
+socket_path = "/var/run/vmm-vhost-net0.sock"
+
+[usb]
+bus = 7
+type = "xhci"
+ports = 8
+client_usbip_server = "[2001:db8::200]:3241"
+use_tls = true # :3241, TLS 1.3
+tls_verify_cert = false # relies on external cluster TLS authority
+
+[backup]
+zstd_level = 3
+nice_priority = 19
+ioprio_idle = true
+quiesce_timeout_secs = 10 # best-effort; on timeout -> crash-consistent

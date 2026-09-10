@@ -1,0 +1,26 @@
+[package]
+name = "vmm-console-client"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+vmm-codec-sys = { workspace = true }
+libvmm-config.workspace = true
+libvmm-core.workspace = true
+libvmm-control.workspace = true
+libvmm-media.workspace = true
+libvmm-usbip.workspace = true
+libvmm-virtio.workspace = true
+libc.workspace = true
+wayland-client.workspace = true
+wayland-protocols.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+rustls.workspace = true
+clap.workspace = true
+log.workspace = true
+env_logger.workspace = true
+

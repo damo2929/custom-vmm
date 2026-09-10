@@ -1,0 +1,12 @@
+[package]
+name = "libvmm-usbip"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+libvmm-config.workspace = true
+libvmm-core.workspace = true
+log.workspace = true

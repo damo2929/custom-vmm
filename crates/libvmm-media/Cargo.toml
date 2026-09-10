@@ -1,0 +1,20 @@
+[package]
+name = "libvmm-media"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+vmm-codec-sys = { workspace = true }
+libvmm-config.workspace = true
+libvmm-core.workspace = true
+libvmm-control.workspace = true
+base64.workspace = true
+rustls.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+base64.workspace = true
+rustls.workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "libvmm-control"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+libvmm-config.workspace = true
+libvmm-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+libc.workspace = true
+sha1.workspace = true
+log.workspace = true
+rustls.workspace = true
+rcgen.workspace = true
