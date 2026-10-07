@@ -69,7 +69,7 @@ pkg-config  = "0.3"
 # compositor socket and does NOT link libwayland.
 wayland-client    = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
-kvm-ioctls  = "0.18"
+kvm-ioctls  = "0.19"
 kvm-bindings = "0.9"
 vmm-sys-util = "0.12"
 
